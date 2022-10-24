@@ -43,6 +43,7 @@ class DockerRun:
         self.__tty__ = False
         self.__docker_options__ = []
         self.__docker_run_options__ = []
+        self.__docker_login__ = None
 
     @classmethod
     def from_parameters(cls, params, job):
@@ -91,6 +92,11 @@ class DockerRun:
                     "dispatcher configuration."
                 )
                 self.__local__ = False
+        elif self.__docker_login__:
+            raise InfrastructureError(
+                "Cannot run 'docker login' due to docker_secure not "
+                "being set in dispatcher configuration."
+            )
 
     def network(self, network):
         self.__network__ = network
@@ -100,6 +106,15 @@ class DockerRun:
 
     def hostname(self, hostname):
         self.__hostname__ = hostname
+
+    def docker_login(self, docker_login):
+        if self.__secure__:
+            self.__docker_login__ = docker_login
+        elif docker_login:
+            raise InfrastructureError(
+                "Cannot run 'docker login' due to docker_secure not "
+                "being set in dispatcher configuration."
+            )
 
     def workdir(self, workdir):
         self.__workdir__ = workdir
@@ -197,6 +212,14 @@ class DockerRun:
                 action=action,
             )
         else:
+            if self.__docker_login__:
+                login_cmd = ["docker", "login"]
+                if "user" in self.__docker_login__:
+                    login_cmd.extend(["-u", self.__docker_login__["user"]])
+                if "password" in self.__docker_login__:
+                    login_cmd.extend(["-p", self.__docker_login__["password"]])
+                login_cmd.append(self.__docker_login__["registry"])
+                self.run_cmd(login_cmd, action=action)
             self.run_cmd(["docker", "pull", self.image], action=action)
         self.__check_image_arch__()
 
