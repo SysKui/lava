@@ -155,6 +155,7 @@ class CallQemuAction(Action):
     def get_raw_version(self, architecture):
         if "docker" in self.parameters:
             docker = DockerRun.from_parameters(self.parameters["docker"], self.job)
+            docker.docker_login(self.parameters["docker"].get("login"))
             docker.run(
                 *shlex.split(
                     "qemu-system-%s --version" % self.get_qemu_arch(architecture)
@@ -367,6 +368,7 @@ class CallQemuAction(Action):
             self.docker = docker = DockerRun.from_parameters(
                 self.parameters["docker"], self.job
             )
+            docker.docker_login(self.parameters["docker"].get("login"))
             docker.name(
                 "lava-docker-qemu-%s-%s-" % (self.job.job_id, self.level),
                 random_suffix=True,

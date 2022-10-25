@@ -26,7 +26,7 @@ from lava_common.schemas import boot, docker
 
 
 def qemu_docker():
-    return {**docker(), Optional("binary"): str}
+    return {**docker(docker_login=True), Optional("binary"): str}
 
 
 def schema():
