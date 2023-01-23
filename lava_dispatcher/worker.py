@@ -32,6 +32,7 @@ import signal
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import time
 import traceback
 from dataclasses import dataclass
@@ -86,7 +87,7 @@ URL_WORKERS = "/scheduler/internal/v1/workers/"
 ###########
 # Helpers #
 ###########
-def create_environ(env: str) -> Dict[str, str]:
+def create_environ(env: str, home_dir: str) -> Dict[str, str]:
     """
     Generate the env variables for the job.
     """
@@ -101,7 +102,17 @@ def create_environ(env: str) -> Dict[str, str]:
                 del environ[var]
         # Override
         environ.update(conf.get("overrides", {}))
+    environ["HOME"] = home_dir
     return environ
+
+
+def create_home_dir():
+    """
+    Create a temporary home directory for each run. This provides
+    isolation between jobs, particularly when we store Docker
+    credentials.
+    """
+    return tempfile.mkdtemp(prefix="job-home-", suffix=".d")
 
 
 def get_prefix(cfg):
@@ -156,6 +167,7 @@ def start_job(
     env_str: str,
     env_dut: str,
     job_log_interval: int,
+    home_dir: str,
 ) -> Optional[int]:
     """
     Start the lava-run process and return the pid
@@ -181,7 +193,7 @@ def start_job(
         else:
             out_file = (base_dir / "stdout").open("w")
             err_file = (base_dir / "stderr").open("w")
-        env = create_environ(env_str)
+        env = create_environ(env_str, home_dir)
         args = [
             # Run lava-run under nice so every sub-commands will be niced
             "nice",
@@ -234,6 +246,7 @@ class Job:
         self.prefix = row["prefix"]
         self.last_update = row["last_update"]
         self.token = row["token"]
+        self.home_dir = row["home_dir"]
         # Create the base directory
         self.base_dir = tmp_dir / "{prefix}{job_id}".format(
             prefix=self.prefix, job_id=str(self.job_id)
@@ -298,9 +311,20 @@ class JobsDB:
                 "ALTER TABLE jobs ADD COLUMN token VARCHAR(32) DEFAULT ''"
             )
             self.conn.commit()
+        if "home_dir" not in sql:
+            self.conn.execute(
+                "ALTER TABLE jobs ADD COLUMN home_dir VARCHAR(100) DEFAULT ''"
+            )
+            self.conn.commit()
 
     def create(
-        self, job_id: int, pid: int, status: int, dispatcher_cfg: str, token: str
+        self,
+        job_id: int,
+        pid: int,
+        status: int,
+        dispatcher_cfg: str,
+        token: str,
+        home_dir: str,
     ) -> Optional[Job]:
         """
         When pid is 0, the pid is unknown
@@ -311,7 +335,7 @@ class JobsDB:
 
         with contextlib.suppress(sqlite3.Error):
             self.conn.execute(
-                "INSERT INTO jobs VALUES(?, ?, ?, ?, ?, ?)",
+                "INSERT INTO jobs VALUES(?, ?, ?, ?, ?, ?, ?)",
                 (
                     str(job_id),
                     str(pid),
@@ -319,6 +343,7 @@ class JobsDB:
                     str(int(time.monotonic())),
                     prefix,
                     token,
+                    home_dir,
                 ),
             )
             self.conn.commit()
@@ -409,7 +434,7 @@ def cancel(url: str, jobs: JobsDB, job_id: int, token: str) -> None:
     job = jobs.get(job_id)
     if job is None:
         LOG.debug("[%d] Unknown job", job_id)
-        job = jobs.create(job_id, 0, Job.FINISHED, "", token)
+        job = jobs.create(job_id, 0, Job.FINISHED, "", token, "")
     else:
         if job.status == Job.RUNNING and job.is_running():
             LOG.debug("[%d] Canceling", job_id)
@@ -484,6 +509,10 @@ def check(url: str, jobs: JobsDB) -> None:
                 continue
             LOG.debug("[%d] Removing %s", job.job_id, dir_path)
             shutil.rmtree(str(dir_path), ignore_errors=True)
+
+        # Always remove our temporary home directory
+        if len(job.home_dir) > 0:
+            shutil.rmtree(job.home_dir)
 
         jobs.delete(job.job_id)
 
@@ -568,12 +597,15 @@ def start(
             LOG.error("[%d] -> invalid response: %r", job_id, str(exc))
             return
 
+        home_dir = create_home_dir()
+
         LOG.info("[%d] Starting job", job_id)
         LOG.debug("[%d]         : %s", job_id, yaml_safe_load(definition))
         LOG.debug("[%d] device  : %s", job_id, yaml_safe_load(device))
         LOG.debug("[%d] dispatch: %s", job_id, yaml_safe_load(dispatcher))
         LOG.debug("[%d] env     : %s", job_id, yaml_safe_load(env))
         LOG.debug("[%d] env-dut : %s", job_id, yaml_safe_load(env_dut))
+        LOG.debug("[%d] home    : %s", job_id, home_dir)
 
         # Start the job, grab the pid and create it in the dabatase
         pid = start_job(
@@ -586,6 +618,7 @@ def start(
             env,
             env_dut,
             job_log_interval,
+            home_dir,
         )
         job = jobs.create(
             job_id,
@@ -593,6 +626,7 @@ def start(
             Job.FINISHED if pid is None else Job.RUNNING,
             yaml_safe_load(dispatcher),
             token,
+            home_dir,
         )
     else:
         LOG.info("[%d] -> already running", job_id)
