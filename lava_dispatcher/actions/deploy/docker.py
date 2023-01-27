@@ -72,7 +72,20 @@ class DockerAction(Action):
             self.local = False
         else:
             self.image_name = image["name"]
-            self.local = image.get("local", False)
+            secure = self.job.parameters.get("dispatcher", {}).get(
+                "docker_secure", False
+            )
+            self.local = False
+
+            if not secure:
+                self.local = image.get("local", False)
+            else:
+                if image.get("local", False):
+                    self.logger.warning(
+                        "Ignoring 'docker:image:local:' which "
+                        "conflicts with docker_secure being set in "
+                        "dispatcher configuration."
+                    )
 
         # check docker image name
         # The string should be safe for command line inclusion
