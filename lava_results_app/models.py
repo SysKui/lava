@@ -299,6 +299,21 @@ class TestCase(models.Model, Queryable):
     lava-test-case or action result
     """
 
+    class Meta:
+        indexes = (
+            models.Index(
+                fields=("-suite",),
+                condition=(
+                    Q(name="job")
+                    & Q(result=1)  # HACK: Refers to RESULT_FAIL
+                    & Q(
+                        metadata__regex="error_type: (Configuration|Infrastructure|Bug)"
+                    )
+                ),
+                name="testcases_with_job_errors_idx",
+            ),
+        )
+
     objects = models.Manager.from_queryset(RestrictedTestCaseQuerySet)()
 
     RESULT_PASS = 0
