@@ -63,7 +63,10 @@ variables:
 amd64/dispatcher-debian-11: *dispatcher
 amd64/server-debian-11: *server
 amd64/dispatcher-debian-12: *dispatcher
-amd64/server-debian-12: *server
+amd64/server-debian-12:
+  <<: *server
+  tags:
+    - saas-linux-medium-amd64  # 4 way parallel tests
 aarch64/dispatcher-debian-11:
   <<: *dispatcher
   tags:
