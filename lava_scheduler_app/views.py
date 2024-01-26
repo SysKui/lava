@@ -325,9 +325,9 @@ class DeviceTableView(JobTableView):
         return q.prefetch_related(
             Prefetch(
                 "testjobs",
-                queryset=TestJob.objects.filter(
-                    ~Q(state=TestJob.STATE_FINISHED)
-                ).select_related("submitter"),
+                queryset=TestJob.objects.visible_by_user(self.request.user)
+                .filter(~Q(state=TestJob.STATE_FINISHED))
+                .select_related("submitter"),
                 to_attr="running_jobs",
             )
         )
@@ -738,9 +738,9 @@ class NoDTDeviceView(DeviceTableView):
         return q.prefetch_related(
             Prefetch(
                 "testjobs",
-                queryset=TestJob.objects.filter(
-                    ~Q(state=TestJob.STATE_FINISHED)
-                ).select_related("submitter"),
+                queryset=TestJob.objects.visible_by_user(self.request.user)
+                .filter(~Q(state=TestJob.STATE_FINISHED))
+                .select_related("submitter"),
                 to_attr="running_jobs",
             )
         )
