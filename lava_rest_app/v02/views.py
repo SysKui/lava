@@ -494,7 +494,7 @@ class TestJobViewSet(viewsets.ModelViewSet):
         # this method would report as you successfully cancelled the job
         # even if you don't have required permissions.
         with transaction.atomic():
-            job = TestJob.objects.select_for_update().get(pk=kwargs["pk"])
+            job = TestJob.get_by_job_number(kwargs["pk"], for_update=True)
             job.cancel(request.user)
         return Response(
             {"message": "Job cancel signal sent."}, status=status.HTTP_200_OK
