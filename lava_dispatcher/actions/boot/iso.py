@@ -57,7 +57,6 @@ class BootIsoInstallerAction(RetryAction):
 
 
 class IsoCommandLine(Action):
-
     """
     qemu-system-x86_64 -nographic -enable-kvm -cpu host -net nic,model=virtio,macaddr=52:54:00:12:34:59 -net user -m 2048 \
     -drive format=raw,file=hd_img.img -drive file=${NAME},index=2,media=cdrom,readonly \
@@ -117,7 +116,7 @@ class IsoCommandLine(Action):
             )
         self.logger.debug("started a shell command")
 
-        shell_connection = ShellSession(self.job, shell)
+        shell_connection = ShellSession(shell)
         shell_connection.prompt_str = self.get_namespace_data(
             action="prepare-qemu-commands", label="prepare-qemu-commands", key="prompts"
         )
@@ -219,7 +218,7 @@ class IsoRebootAction(Action):
             )
         self.logger.debug("started a shell command")
 
-        shell_connection = ShellSession(self.job, shell)
+        shell_connection = ShellSession(shell)
         shell_connection = super().run(shell_connection, max_end_time)
         shell_connection.prompt_str = [INSTALLER_QUIET_MSG]
         self.wait(shell_connection)
