@@ -42,6 +42,7 @@ class ShellLogger:
         self.logger = logger
         self.is_feedback = False
         self.is_input = is_input
+        self.namespace: str | None = None
 
     def write(self, new_line):
         replacements = {
