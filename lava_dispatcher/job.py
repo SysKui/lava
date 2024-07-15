@@ -27,8 +27,7 @@ if TYPE_CHECKING:
     from typing import Any
 
     from lava_common.timeout import Timeout
-
-    from .device import Device
+    from lava_dispatcher.device import DeviceDict
 
 
 class Job:
@@ -43,7 +42,7 @@ class Job:
         logging_level
         job_timeout
     Job also provides the primary access to the Device.
-    The NewDevice class only loads the specific configuration of the
+    The DeviceDict class only loads the specific configuration of the
     device for this job - one job, one device.
     """
 
@@ -52,7 +51,7 @@ class Job:
         job_id: int,
         parameters: dict[str, Any],
         logger: Logger,
-        device: Device,
+        device: DeviceDict,
         timeout: Timeout,
     ):
         self.job_id = job_id
