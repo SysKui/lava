@@ -1304,11 +1304,6 @@ def internal_v1_jobs_logs(request, pk):
     except ValueError:
         return JsonResponse({"error": "Invalid 'index'"}, status=400)
 
-    # TODO: leaky logutils abstraction
-    path = Path(job.output_dir)
-    path.mkdir(mode=0o755, parents=True, exist_ok=True)
-    output = (path / "output.yaml").open("ab")
-    index = (path / "output.idx").open("ab")
     line_skip = logs_instance.line_count(job) - line_idx
 
     # TODO: use a database transaction so all or none objects are saved
@@ -1316,63 +1311,64 @@ def internal_v1_jobs_logs(request, pk):
     #       of lines that where actually parsed !!
     test_cases = []
     line_count = 0
-    for line, string in zip(yaml_safe_load(lines), lines.split("\n")):
-        # skip lines that where already saved to disk
-        duplicated = False
-        if line_skip > 0:
-            duplicated = True
-            line_skip -= 1
-        else:
-            # Handle lava-event
-            if line["lvl"] == "event":
-                send_event(
-                    ".event", "lavaserver", {"message": line["msg"], "job": job.id}
+    with logs_instance.enter_writer(job) as logs_writer:
+        for line, string in zip(yaml_safe_load(lines), lines.split("\n")):
+            # skip lines that where already saved to disk
+            duplicated = False
+            if line_skip > 0:
+                duplicated = True
+                line_skip -= 1
+            else:
+                # Handle lava-event
+                if line["lvl"] == "event":
+                    send_event(
+                        ".event", "lavaserver", {"message": line["msg"], "job": job.id}
+                    )
+                    line["lvl"] = "debug"
+                    string = "- " + dump(line)
+
+                # Save the log line
+                logs_writer.write_line(line, string + "\n")
+
+            # handle test case results
+            if line["lvl"] == "results":
+                starttc = endtc = None
+                with contextlib.suppress(KeyError):
+                    starttc = line["msg"]["starttc"]
+                    del line["msg"]["starttc"]
+                with contextlib.suppress(KeyError):
+                    endtc = line["msg"]["endtc"]
+                    del line["msg"]["endtc"]
+                meta_filename = create_metadata_store(line["msg"], job)
+                new_test_case = map_scanned_results(
+                    results=line["msg"],
+                    job=job,
+                    starttc=starttc,
+                    endtc=endtc,
+                    meta_filename=meta_filename,
                 )
-                line["lvl"] = "debug"
-                string = "- " + dump(line)
 
-            # Save the log line
-            logs_instance.write(job, (string + "\n").encode("utf-8"), output, index)
-
-        # handle test case results
-        if line["lvl"] == "results":
-            starttc = endtc = None
-            with contextlib.suppress(KeyError):
-                starttc = line["msg"]["starttc"]
-                del line["msg"]["starttc"]
-            with contextlib.suppress(KeyError):
-                endtc = line["msg"]["endtc"]
-                del line["msg"]["endtc"]
-            meta_filename = create_metadata_store(line["msg"], job)
-            new_test_case = map_scanned_results(
-                results=line["msg"],
-                job=job,
-                starttc=starttc,
-                endtc=endtc,
-                meta_filename=meta_filename,
-            )
-
-            if new_test_case is not None:
-                # If the log lines are a resubmission of a previous failed
-                # submission, count the number of TestCase that are identical
-                # to the new one. This will avoid saving multiple time the same
-                # TestCase
-                count = 0
-                if duplicated:
-                    count = TestCase.objects.filter(
-                        name=new_test_case.name,
-                        units=new_test_case.units,
-                        result=new_test_case.result,
-                        measurement=new_test_case.measurement,
-                        metadata=new_test_case.metadata,
-                        suite=new_test_case.suite,
-                        start_log_line=new_test_case.start_log_line,
-                        end_log_line=new_test_case.end_log_line,
-                        test_set=new_test_case.test_set,
-                    ).count()
-                if count == 0:
-                    test_cases.append(new_test_case)
-        line_count += 1
+                if new_test_case is not None:
+                    # If the log lines are a resubmission of a previous failed
+                    # submission, count the number of TestCase that are identical
+                    # to the new one. This will avoid saving multiple time the same
+                    # TestCase
+                    count = 0
+                    if duplicated:
+                        count = TestCase.objects.filter(
+                            name=new_test_case.name,
+                            units=new_test_case.units,
+                            result=new_test_case.result,
+                            measurement=new_test_case.measurement,
+                            metadata=new_test_case.metadata,
+                            suite=new_test_case.suite,
+                            start_log_line=new_test_case.start_log_line,
+                            end_log_line=new_test_case.end_log_line,
+                            test_set=new_test_case.test_set,
+                        ).count()
+                    if count == 0:
+                        test_cases.append(new_test_case)
+            line_count += 1
 
     # Save the new test cases
     try:
