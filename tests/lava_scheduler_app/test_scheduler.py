@@ -117,10 +117,10 @@ class TestHealthCheckScheduling(TestCase):
         workers_limit = worker_summary(
             Worker.objects.filter(hostname__in=["worker-01", "worker-03"])
         )
-        available_devices = schedule_health_checks(
-            logging.getLogger(), [], workers_limit
+        already_scheduled_devices = schedule_health_checks(
+            logging.getLogger(), set(), workers_limit
         )
-        self.assertEqual(available_devices, {"panda": ["panda01", "panda03"]})
+        self.assertEqual(already_scheduled_devices, set())
 
     @patch.object(Device, "get_health_check", _minimal_valid_job)
     def test_disabled_hc(self):
@@ -133,10 +133,10 @@ class TestHealthCheckScheduling(TestCase):
         workers_limit = worker_summary(
             Worker.objects.filter(hostname__in=["worker-01", "worker-03"])
         )
-        available_devices = schedule_health_checks(
-            logging.getLogger(), [], workers_limit
+        already_scheduled_devices = schedule_health_checks(
+            logging.getLogger(), set(), workers_limit
         )
-        self.assertEqual(available_devices, {"panda": ["panda01", "panda03"]})
+        self.assertEqual(already_scheduled_devices, set())
 
     @patch.object(Device, "get_health_check", _minimal_valid_job)
     def test_no_devicedict(self):
@@ -151,7 +151,7 @@ class TestHealthCheckScheduling(TestCase):
         workers_limit = worker_summary(
             Worker.objects.filter(hostname__in=["worker-01", "worker-03"])
         )
-        schedule_health_checks(logging.getLogger(), [], workers_limit)
+        schedule_health_checks(logging.getLogger(), set(), workers_limit)
 
         self.device04.refresh_from_db()
         self.assertFalse(self.device04.is_valid())
@@ -167,10 +167,10 @@ class TestHealthCheckScheduling(TestCase):
         workers_limit = worker_summary(
             Worker.objects.filter(hostname__in=["worker-01", "worker-03"])
         )
-        available_devices = schedule_health_checks(
-            logging.getLogger(), [], workers_limit
+        already_scheduled_devices = schedule_health_checks(
+            logging.getLogger(), set(), workers_limit
         )
-        self.assertEqual(available_devices, {"panda": []})
+        self.assertEqual(already_scheduled_devices, {"panda01", "panda03"})
         self._check_hc_scheduled(self.device01)
         self._check_hc_not_scheduled(self.device02)
         self._check_hc_scheduled(self.device03)
@@ -190,10 +190,15 @@ class TestHealthCheckScheduling(TestCase):
         workers_limit = worker_summary(
             Worker.objects.filter(hostname__in=["worker-01", "worker-03"])
         )
-        available_devices = schedule_health_checks(
-            logging.getLogger(), [], workers_limit
+        already_scheduled_devices = schedule_health_checks(
+            logging.getLogger(), set(), workers_limit
         )
-        self.assertEqual(available_devices, {"panda": ["panda03"]})
+        self.assertEqual(
+            already_scheduled_devices,
+            {
+                "panda01",
+            },
+        )
         self._check_hc_scheduled(self.device01)
         self._check_hc_not_scheduled(self.device02)
         self._check_hc_not_scheduled(self.device03)
@@ -215,10 +220,12 @@ class TestHealthCheckScheduling(TestCase):
         workers_limit = worker_summary(
             Worker.objects.filter(hostname__in=["worker-03"])
         )
-        available_devices = schedule_health_checks(
-            logging.getLogger(), [], workers_limit
+        already_scheduled_devices = schedule_health_checks(
+            logging.getLogger(),
+            set(),
+            workers_limit,
         )
-        self.assertEqual(available_devices, {"panda": ["panda03"]})
+        self.assertEqual(already_scheduled_devices, set())
         self._check_hc_not_scheduled(self.device01)
         self._check_hc_not_scheduled(self.device02)
         self._check_hc_not_scheduled(self.device03)
@@ -238,10 +245,10 @@ class TestHealthCheckScheduling(TestCase):
         workers_limit = worker_summary(
             Worker.objects.filter(hostname__in=["worker-01", "worker-03"])
         )
-        available_devices = schedule_health_checks(
-            logging.getLogger(), [], workers_limit
+        already_scheduled_devices = schedule_health_checks(
+            logging.getLogger(), set(), workers_limit
         )
-        self.assertEqual(available_devices, {"panda": []})
+        self.assertEqual(already_scheduled_devices, {"panda01", "panda03"})
         self._check_hc_scheduled(self.device01)
         self._check_hc_not_scheduled(self.device02)
         self._check_hc_scheduled(self.device03)
@@ -267,10 +274,10 @@ class TestHealthCheckScheduling(TestCase):
             workers_limit = worker_summary(
                 Worker.objects.filter(hostname__in=["worker-01", "worker-03"])
             )
-            available_devices = schedule_health_checks(
+            already_scheduled_devices = schedule_health_checks(
                 logging.getLogger(), [], workers_limit
             )
-            self.assertEqual(available_devices, {"panda": []})
+            self.assertEqual(already_scheduled_devices, set())
             self._check_hc_not_scheduled(self.device01)
             self._check_hc_not_scheduled(self.device02)
             self._check_hc_not_scheduled(self.device03)
@@ -298,7 +305,7 @@ class TestHealthCheckScheduling(TestCase):
             submitter=self.user,
             definition=_minimal_valid_job(None),
         )
-        schedule(logging.getLogger(), [], ["worker-01", "worker-03"])
+        schedule(logging.getLogger(), set(), ["worker-01", "worker-03"])
         self.device01.refresh_from_db()
         j.refresh_from_db()
         self.assertEqual(j.state, TestJob.STATE_SCHEDULED)
@@ -316,7 +323,7 @@ class TestHealthCheckScheduling(TestCase):
         self.last_hc03.submit_time = timezone.now() - timedelta(hours=25)
         self.last_hc03.save()
 
-        schedule(logging.getLogger(), [], ["worker-01", "worker-03"])
+        schedule(logging.getLogger(), set(), ["worker-01", "worker-03"])
         self.device03.refresh_from_db()
         j.refresh_from_db()
         self.assertEqual(j.state, TestJob.STATE_SUBMITTED)
@@ -350,7 +357,7 @@ class TestHealthCheckScheduling(TestCase):
                 definition=_minimal_valid_job(None),
             )
 
-        schedule(logging.getLogger(), [], ["worker-01", "worker-03"])
+        schedule(logging.getLogger(), set(), ["worker-01", "worker-03"])
         self.device03.refresh_from_db()
         jobs = TestJob.objects.filter(state=TestJob.STATE_SCHEDULED)
         self.assertEqual(jobs.count(), 1)
@@ -360,7 +367,7 @@ class TestHealthCheckScheduling(TestCase):
         j.start_time = timezone.now() - timedelta(hours=1)
         j.save()
 
-        schedule(logging.getLogger(), [], ["worker-01", "worker-03"])
+        schedule(logging.getLogger(), set(), ["worker-01", "worker-03"])
         self.device03.refresh_from_db()
         jobs = TestJob.objects.filter(state=TestJob.STATE_SCHEDULED)
         self.assertEqual(jobs.count(), 1)
@@ -370,7 +377,7 @@ class TestHealthCheckScheduling(TestCase):
         j.start_time = timezone.now() - timedelta(hours=1)
         j.save()
 
-        schedule(logging.getLogger(), [], ["worker-01", "worker-03"])
+        schedule(logging.getLogger(), set(), ["worker-01", "worker-03"])
         self.device03.refresh_from_db()
         jobs = TestJob.objects.filter(state=TestJob.STATE_SUBMITTED)
         self.assertEqual(jobs.count(), 1)
