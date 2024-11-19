@@ -9,8 +9,10 @@ ARG base_image=""
 # Call the install script in a empty image
 FROM debian:bookworm-slim as build
 ARG lava_version=""
+# Use the CN mirror apt sources
+COPY docker/debian.sources /etc/apt/sources.list.d/debian.sources
 RUN apt-get update && \
-    apt-get install --no-install-recommends --yes python3 python3-setuptools
+apt-get install --no-install-recommends --yes python3 python3-setuptools
 
 # Install lava-lxc-mocker
 COPY lava/lxc-mocker/ /install/usr/bin/

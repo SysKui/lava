@@ -8,6 +8,7 @@ from __future__ import annotations
 import os
 import shlex
 import subprocess
+import time
 from typing import TYPE_CHECKING
 
 from lava_common.constants import DISPATCHER_DOWNLOAD_DIR, SYS_CLASS_KVM
@@ -358,9 +359,20 @@ class CallQemuAction(Action):
                 % (self.sub_command, shell.exitstatus, shell.readlines())
             )
         self.logger.debug("started a shell command")
-
+        self.logger.debug("2024110825")
         shell_connection = self.session_class(self.job, shell)
         shell_connection = super().run(shell_connection, max_end_time)
+
+        # auto inject faults
+        flipshell = """gdb -q \
+-ex 'set logging enable on' \
+-ex 'set pagination off' \
+-ex 'target remote:1234' \
+-ex 'maintenance packet Qqemu.PhyMemMode:1' \
+-ex 'source gdb/fliputils.py' \
+-ex 'autoinject 10 1s 2s ram' \
+-ex 'detach' -ex 'quit' > /dev/null"""
+        os.system(flipshell)
 
         self.set_namespace_data(
             action="shared", label="shared", key="connection", value=shell_connection

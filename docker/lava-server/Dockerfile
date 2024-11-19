@@ -8,6 +8,8 @@ ARG base_image=""
 
 # Build the documentation
 FROM debian:bookworm-slim AS doc
+# Use the CN mirror apt sources
+COPY docker/debian.sources /etc/apt/sources.list.d/debian.sources
 RUN apt-get update && \
     apt-get install --yes --no-install-recommends git make python3-sphinx python3-sphinx-bootstrap-theme
 
