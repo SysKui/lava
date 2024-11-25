@@ -5,7 +5,7 @@
 #
 # SPDX-License-Identifier: GPL-2.0-or-later
 
-from voluptuous import Msg, Optional, Required
+from voluptuous import Msg, Optional, Required, All
 
 from lava_common.schemas import boot, docker
 
@@ -13,6 +13,13 @@ from lava_common.schemas import boot, docker
 def qemu_docker():
     return {**docker(), Optional("binary"): str}
 
+def qemu_fault_inject():
+    return {
+        Required("commands"): list,
+        Required("stdout"): str,
+        Required("stderr"): str,
+    }
+    
 
 def schema():
     base = {
@@ -25,5 +32,6 @@ def schema():
             "auto_login"
         ): boot.auto_login(),  # TODO: if auto_login => prompt is required
         Optional("docker"): qemu_docker(),
+        Optional("fault_inject"): qemu_fault_inject(),
     }
     return {**boot.schema(), **base}

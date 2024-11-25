@@ -8,7 +8,8 @@ from __future__ import annotations
 import os
 import shlex
 import subprocess
-import time
+import shutil
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from lava_common.constants import DISPATCHER_DOWNLOAD_DIR, SYS_CLASS_KVM
@@ -363,16 +364,35 @@ class CallQemuAction(Action):
         shell_connection = self.session_class(self.job, shell)
         shell_connection = super().run(shell_connection, max_end_time)
 
-        # auto inject faults
-        flipshell = """gdb -q \
--ex 'set logging enable on' \
--ex 'set pagination off' \
--ex 'target remote:1234' \
--ex 'maintenance packet Qqemu.PhyMemMode:1' \
--ex 'source gdb/fliputils.py' \
--ex 'autoinject 10 1s 2s ram' \
--ex 'detach' -ex 'quit' > /dev/null"""
-        os.system(flipshell)
+        # Inject faults into qemu virtual machine
+        rootfs_url = self.job.parameters['actions'][0]['deploy']['images']['rootfs']['url']
+        fault_inject = self.job.parameters['actions'][1]['boot'].get('fault_inject', {})
+        inject_command = fault_inject.get('commands', [])
+        log_stdout = fault_inject.get('stdout', "/dev/null")
+        log_stderr = fault_inject.get('stderr', "/dev/null")
+        if inject_command != []:
+            if not Path("/root/flipgdb/fliputils.py").exists():
+                self.logger.debug("/root/flipgdb/fliputils.py not exist")
+            elif shutil.which("gdb-multiarch") == None:
+                self.logger.debug("Executable gdb-multiarch is not found")
+            else:
+                flipshell = [
+                    "gdb-multiarch",
+                    "-q",
+                    "-batch",
+                    "-ex","set pagination off",
+                    "-ex","target remote:1234",
+                    "-ex","maintenance packet Qqemu.PhyMemMode:1",
+                    "-ex","source /root/flipgdb/fliputils.py",
+                ]
+                for cmd in inject_command:
+                    if cmd.strip().startswith("snapinject") and not rootfs_url.endswith("qcow2"):
+                        self.logger.error("Image type is not qcow2")
+                    else:
+                        flipshell.extend(["-ex", cmd])
+                with open(log_stdout, "w") as stdout, open(log_stderr, "w") as stderr:
+                    subprocess.Popen(flipshell, stdout=stdout, stderr=stderr)
+                self.logger.debug("Spawn a thread to inject faults, Command is %s", flipshell)
 
         self.set_namespace_data(
             action="shared", label="shared", key="connection", value=shell_connection
