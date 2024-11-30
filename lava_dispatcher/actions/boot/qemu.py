@@ -9,6 +9,8 @@ import os
 import shlex
 import subprocess
 import shutil
+import threading
+import re
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -56,6 +58,34 @@ class BootQemuRetry(RetryAction):
         self.pipeline = Pipeline(parent=self, job=self.job, parameters=parameters)
         self.pipeline.add_action(CallQemuAction(self.job))
 
+
+class TimerWithCallback():
+    def __init__(self, interval, callback, *args, **kwargs):
+        """
+        :param interval: timer interval
+        :param callback: callback function
+        :param args: function args
+        :param kwargs: function args
+        """
+        self.interval = interval
+        self.callback = callback
+        self.args = args
+        self.kwargs = kwargs
+        self.timer = None
+
+    def start(self):
+        """Start the timer"""
+        self.timer = threading.Timer(self.interval, self._run)
+        self.timer.start()
+
+    def _run(self):
+        """run the callback function"""
+        self.callback(*self.args, **self.kwargs)
+
+    def cancel(self):
+        """cancel the timer"""
+        if self.timer is not None:
+            self.timer.cancel()
 
 class CallQemuAction(Action):
     name = "execute-qemu"
@@ -370,13 +400,16 @@ class CallQemuAction(Action):
         inject_command = fault_inject.get('commands', [])
         log_stdout = fault_inject.get('stdout', "/dev/null")
         log_stderr = fault_inject.get('stderr', "/dev/null")
+        delayed = fault_inject.get('delayed', "")
+        flipshell = []
+        # parse inject_command 
         if inject_command != []:
             if not Path("/root/flipgdb/fliputils.py").exists():
                 self.logger.debug("/root/flipgdb/fliputils.py not exist")
             elif shutil.which("gdb-multiarch") == None:
                 self.logger.debug("Executable gdb-multiarch is not found")
             else:
-                flipshell = [
+                flipshell.extend([
                     "gdb-multiarch",
                     "-q",
                     "-batch",
@@ -384,15 +417,18 @@ class CallQemuAction(Action):
                     "-ex","target remote:1234",
                     "-ex","maintenance packet Qqemu.PhyMemMode:1",
                     "-ex","source /root/flipgdb/fliputils.py",
-                ]
+                ])
                 for cmd in inject_command:
                     if cmd.strip().startswith("snapinject") and not rootfs_url.endswith("qcow2"):
                         self.logger.error("Image type is not qcow2")
                     else:
                         flipshell.extend(["-ex", cmd])
-                with open(log_stdout, "w") as stdout, open(log_stderr, "w") as stderr:
-                    subprocess.Popen(flipshell, stdout=stdout, stderr=stderr)
-                self.logger.debug("Spawn a thread to inject faults, Command is %s", flipshell)
+        
+        if delayed != "":
+            timer = TimerWithCallback(parse_time_string(delayed), fault_inject_callback, flipshell, log_stdout, log_stderr, self.logger)
+            timer.start()
+        else:
+            fault_inject_callback(flipshell, log_stdout, log_stderr, self.logger)
 
         self.set_namespace_data(
             action="shared", label="shared", key="connection", value=shell_connection
@@ -404,5 +440,33 @@ class CallQemuAction(Action):
             self.logger.info("Stopping the qemu container %s", self.docker.__name__)
             self.docker.destroy()
 
+def fault_inject_callback(flipshell, log_stdout, log_stderr, logger):
+    with open(log_stdout, "w") as stdout, open(log_stderr, "w") as stderr:
+        subprocess.Popen(flipshell, stdout=stdout, stderr=stderr)
+    logger.debug("Spawn a thread to inject faults, Command is %s", flipshell)
+
+def parse_time_string(time_str):
+    """
+    解析时间字符串，转换为秒为单位的浮动数值。
+    
+    :param time_str: 时间字符串，例如 '1s', '2ms', '3us'
+    :return: 转换为秒的浮动数值
+    """
+    # 正则表达式匹配数字和单位（秒、毫秒、微秒）
+    match = re.match(r'(\d+)(s|ms|us)', time_str.strip())
+    
+    if not match:
+        raise ValueError(f"Invalid time string: {time_str}")
+    
+    value = int(match.group(1))  # 数值部分
+    unit = match.group(2)        # 单位部分
+
+    # 根据单位转换为秒
+    if unit == 's':
+        return value  # 秒
+    elif unit == 'ms':
+        return value * 1e-3  # 毫秒转秒
+    elif unit == 'us':
+        return value * 1e-6  # 微秒转秒
 
 # FIXME: implement a QEMU protocol to monitor VM boots
