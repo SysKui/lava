@@ -11,6 +11,8 @@ import subprocess
 import shutil
 import threading
 import re
+import json
+import socket
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -86,6 +88,41 @@ class TimerWithCallback():
         """cancel the timer"""
         if self.timer is not None:
             self.timer.cancel()
+
+class SocketClient:
+    def __init__(self, server_address):
+        """:param server_address: socket file path"""
+        # store qemu panic count
+        self.panic = 0
+
+        # unix domain sockets 
+        self.server_address = server_address
+        socket_family = socket.AF_UNIX
+        socket_type = socket.SOCK_STREAM
+
+        self.sock = socket.socket(socket_family, socket_type)
+        try:
+            self.sock.connect(self.server_address)
+        except Exception as e:
+            raise e
+        
+    def send(self, data: str):
+        """Send str to socket server"""
+        self.sock.sendall(data.encode())
+    
+    def listen(self):
+        """Listen the socket server and get the response"""
+        while True:
+            data = self.sock.recv(1024)
+            if not data:
+                break
+            datajs = json.loads(data)
+            if datajs.get("event", "") == "GUEST_PANICKED":
+                self.panic += 1
+    
+    def __del__(self):
+        """Clean the socket"""
+        self.sock.close()
 
 class CallQemuAction(Action):
     name = "execute-qemu"
@@ -390,20 +427,25 @@ class CallQemuAction(Action):
                 % (self.sub_command, shell.exitstatus, shell.readlines())
             )
         self.logger.debug("started a shell command")
-        self.logger.debug("2024110825")
         shell_connection = self.session_class(self.job, shell)
         shell_connection = super().run(shell_connection, max_end_time)
 
         # Inject faults into qemu virtual machine
         rootfs_url = self.job.parameters['actions'][0]['deploy']['images']['rootfs']['url']
+
         fault_inject = self.job.parameters['actions'][1]['boot'].get('fault_inject', {})
         inject_command = fault_inject.get('commands', [])
         log_stdout = fault_inject.get('stdout', "/dev/null")
         log_stderr = fault_inject.get('stderr', "/dev/null")
         delayed = fault_inject.get('delayed', "")
+        socket_file = fault_inject.get('socket', "")
         flipshell = []
-        # parse inject_command 
+
+        # Are there inject_commands?
         if inject_command != []:
+            # Yes, parse inject_command 
+
+            # construct flipshell to inject faults 
             if not Path("/root/flipgdb/fliputils.py").exists():
                 self.logger.debug("/root/flipgdb/fliputils.py not exist")
             elif shutil.which("gdb-multiarch") == None:
@@ -423,12 +465,29 @@ class CallQemuAction(Action):
                         self.logger.error("Image type is not qcow2")
                     else:
                         flipshell.extend(["-ex", cmd])
+            
+            # create a client connected to qemu qmp server to read the panic event and count it
+            cmd_list = " ".join(self.sub_command).split(" ")
+            kernel_file = cmd_list[cmd_list.index('-kernel') + 1]
+            if subprocess.run(['sh', '/root/check-pvpanic', kernel_file]).returncode != 0:
+                # kernel should open pvpanic_pci and pvpanic config,
+                # because driver pvpanic-pci is necessary to get panic event in qemu
+                self.logger.error("pvpanic_pci and pvpanic config not set")
+            elif '-qmp' not in cmd_list or 'pvpanic-pci' not in cmd_list or 'shutdown=pause,panic=none' not in cmd_list:
+                # qemu boot option is not correct, we need '-device pvpanic-pci', '-qmp unix:/tmp/qmp.sock,server=off,wait=no', '-action shutdown=pause,panic=none'
+                self.logger.error('Qemu boot options do not support panic count.')
+            else:
+                try:
+                    socket_client = SocketClient(socket_file)
+                    threading.Thread(target=panic_count, args=(socket_client, self.logger)).start()
+                except Exception as e:
+                    self.logger.error("Count panic got exception: %s", str(e))
         
-        if delayed != "":
-            timer = TimerWithCallback(parse_time_string(delayed), fault_inject_callback, flipshell, log_stdout, log_stderr, self.logger)
-            timer.start()
-        else:
-            fault_inject_callback(flipshell, log_stdout, log_stderr, self.logger)
+            if delayed != "":
+                timer = TimerWithCallback(parse_time_string(delayed), fault_inject_callback, flipshell, log_stdout, log_stderr, self.logger)
+                timer.start()
+            else:
+                fault_inject_callback(flipshell, log_stdout, log_stderr, self.logger)
 
         self.set_namespace_data(
             action="shared", label="shared", key="connection", value=shell_connection
@@ -447,26 +506,39 @@ def fault_inject_callback(flipshell, log_stdout, log_stderr, logger):
 
 def parse_time_string(time_str):
     """
-    解析时间字符串，转换为秒为单位的浮动数值。
+    Parse time string to second float number
     
-    :param time_str: 时间字符串，例如 '1s', '2ms', '3us'
-    :return: 转换为秒的浮动数值
+    :param time_str: time string, like '1s', '2ms', '3us'
+    :return: second float number
     """
-    # 正则表达式匹配数字和单位（秒、毫秒、微秒）
+    
     match = re.match(r'(\d+)(s|ms|us)', time_str.strip())
     
     if not match:
         raise ValueError(f"Invalid time string: {time_str}")
     
-    value = int(match.group(1))  # 数值部分
-    unit = match.group(2)        # 单位部分
+    value = int(match.group(1))  
+    unit = match.group(2)        
 
-    # 根据单位转换为秒
     if unit == 's':
-        return value  # 秒
+        return value  
     elif unit == 'ms':
-        return value * 1e-3  # 毫秒转秒
+        return value * 1e-3  
     elif unit == 'us':
-        return value * 1e-6  # 微秒转秒
+        return value * 1e-6 
+
+def panic_count(socket_client: SocketClient, logger):
+    socket_client.send('{"execute": "qmp_capabilities"}')
+    socket_client.listen()
+    logger.debug(f'panic count: {socket_client.panic}')
+    logger.results(
+        {
+            "definition": "panic count",
+            "case": "panic count",
+            "result": str(socket_client.panic),
+        }
+    )
+    del socket_client
+
 
 # FIXME: implement a QEMU protocol to monitor VM boots

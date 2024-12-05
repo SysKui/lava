@@ -19,6 +19,7 @@ def qemu_fault_inject():
         Required("stdout"): str,
         Required("stderr"): str,
         Optional("delayed"): str,
+        Optional("socket"): str,
     }
     
 
