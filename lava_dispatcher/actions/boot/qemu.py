@@ -13,6 +13,8 @@ import threading
 import re
 import json
 import socket
+import pexpect
+import uuid
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -94,6 +96,9 @@ class SocketClient:
         """:param server_address: socket file path"""
         # store qemu panic count
         self.panic = 0
+        
+        # tmp snapshot
+        self.snapshot_name = uuid.uuid5(uuid.uuid1(), "lava")
 
         # unix domain sockets 
         self.server_address = server_address
@@ -112,6 +117,19 @@ class SocketClient:
     
     def listen(self):
         """Listen the socket server and get the response"""
+
+        # Use ssh to detect the qemu is already booted
+        ssh = pexpect.spawn("ssh -p 2222 root@localhost")
+        ssh.expect("root@localhost's password: ")
+        ssh.sendline("519ailab")
+        ssh.expect("root@raspberrypi:~# ")
+        ssh.sendline('exit')
+
+        # Use monitor to create a snapshot
+        monitor = pexpect.spawn("telnet localhost 4444")
+        monitor.expect("\(qemu\) ")
+        monitor.sendline("savevm " + self.snapshot_name)
+
         while True:
             data = self.sock.recv(1024)
             if not data:
@@ -119,6 +137,19 @@ class SocketClient:
             datajs = json.loads(data)
             if datajs.get("event", "") == "GUEST_PANICKED":
                 self.panic += 1
+                # Panic now, back to snapshot
+                monitor.expect("\(qemu\) ")
+                monitor.sendline("loadvm " + self.snapshot_name)
+        
+        # clean the snapshot
+        monitor.expect("\(qemu\) ")
+        monitor.sendline("delvm " + self.snapshot_name)
+        # quit the telnet
+        monitor.expect("\(qemu\) ")
+        monitor.sendline("\x1d")
+        monitor.expect("telnet> ")
+        monitor.sendline('quit')
+        monitor.close()
     
     def __del__(self):
         """Clean the socket"""
