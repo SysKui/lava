@@ -254,6 +254,13 @@ def main():
             result_dict["error_type"] = error_type
             logger.error(error_help)
         logger.results(result_dict)
+        result_dict = {"definition": "panic_percentage", "case": "panic_percentage"}
+        with open("/tmp/panic_count.txt") as f:
+            result_dict["panic_count"] = f.read().strip()
+        with open("/tmp/fault_number.txt") as f:
+            result_dict["fault_number"] = f.read().strip()
+        result_dict["panic_percentage"] = float(0) if result_dict["fault_number"] == "0" else float(result_dict["panic_count"]) / float(result_dict["fault_number"]) * 100
+        result_dict["result"] = "pass"
 
     # TODO: change the signal handler
 
