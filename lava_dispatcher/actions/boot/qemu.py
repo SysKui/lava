@@ -550,11 +550,11 @@ class CallQemuAction(Action):
                     if cmd.strip().startswith("snapinject") and not rootfs_url.endswith("qcow2"):
                         self.logger.error("Image type is not qcow2")
                     else:
-                        flipshell.extend(["-ex", "'" + cmd + "'"])
+                        flipshell.extend(["-ex", cmd])
                 with open("/tmp/fault_number.txt", "w") as f:
                     f.write(str(fault_number))
                 # Add detach and quit to make sure qemu continue
-                flipshell.extend(["-ex", "'detach'", "-ex", "'quit'"])
+                flipshell.extend(["-ex", "detach", "-ex", "quit"])
             
             # create a client connected to qemu qmp server to read the panic event and count it
             # cmd_list = " ".join(self.sub_command).split(" ")
