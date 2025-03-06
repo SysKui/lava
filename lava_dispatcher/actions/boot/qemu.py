@@ -5,18 +5,19 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 from __future__ import annotations
 
-import os
-import shlex
-import subprocess
-import shutil
-import threading
-import re
 import json
+import os
+import re
+import shlex
+import shutil
 import socket
-import pexpect
+import subprocess
+import threading
 import uuid
 from pathlib import Path
 from typing import TYPE_CHECKING
+
+import pexpect
 
 from lava_common.constants import DISPATCHER_DOWNLOAD_DIR, SYS_CLASS_KVM
 from lava_common.exceptions import JobError
@@ -63,7 +64,7 @@ class BootQemuRetry(RetryAction):
         self.pipeline.add_action(CallQemuAction(self.job))
 
 
-class TimerWithCallback():
+class TimerWithCallback:
     def __init__(self, interval, callback, *args, **kwargs):
         """
         :param interval: timer interval
@@ -91,6 +92,7 @@ class TimerWithCallback():
         if self.timer is not None:
             self.timer.cancel()
 
+
 class SocketClient:
     def __init__(self, server_address, logger, shell):
         """:param server_address: socket file path"""
@@ -102,11 +104,11 @@ class SocketClient:
 
         # set lava logger
         self.logger = logger
-        
+
         # tmp snapshot
         self.snapshot_name = uuid.uuid5(uuid.uuid1(), "lava").hex
 
-        # unix domain sockets 
+        # unix domain sockets
         self.server_address = server_address
         socket_family = socket.AF_UNIX
         socket_type = socket.SOCK_STREAM
@@ -116,14 +118,14 @@ class SocketClient:
             self.sock.connect(self.server_address)
         except Exception as e:
             raise e
-        
+
     def send(self, data: str):
         """Send str to socket server"""
         self.sock.sendall(data.encode())
-    
+
     def listen(self):
         """Listen the socket server and get the response"""
-        
+
         def is_port_listening(host, port):
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.settimeout(1)  # 设置超时
@@ -152,7 +154,7 @@ class SocketClient:
         ssh.expect("root@localhost's password: ", timeout=600)
         ssh.sendline("519ailab")
         ssh.expect("root@raspberrypi:~# ")
-        ssh.sendline('exit')
+        ssh.sendline("exit")
         ssh.close()
         logfile.close()
         self.logger.debug("qemu is already booted")
@@ -186,16 +188,17 @@ class SocketClient:
                     # Panic now, back to snapshot
                     monitor.expect("\(qemu\) ")
                     monitor.sendline("loadvm " + self.snapshot_name)
-                    # FIXME: After loadvm, test shell connection is broken because except 
+                    # FIXME: After loadvm, test shell connection is broken because except
                     # can not match prompt anymore.
                     self.logger.debug("loadvm %s finished", self.snapshot_name)
                     # send enter to qemu when it restore to match pexpect prompt
                     self.shell.send("\r")
                     self.logger.debug("Already sended enter to qemu")
-    
+
     def __del__(self):
         """Clean the socket"""
         self.sock.close()
+
 
 class CallQemuAction(Action):
     name = "execute-qemu"
@@ -495,20 +498,19 @@ class CallQemuAction(Action):
 
         # split normal CI task and SEU test task
         # new_moniter_thread();
-            # - sem 
-            # - parameters: 1000 times, mean
-            # - while flag != success (run qemu thread)
-                # shell = self.shell_class(
-                    #    " ".join(self.sub_command), self.timeout, logger=self.logger
-                # )
-                # read flag from qemu results
-                # read flag from shell.logfile
-                # somehow read results from shell
-                    # - break
-                        # run a new qemu
-                    # - success
-                        # run new iteration && set flags
-
+        # - sem
+        # - parameters: 1000 times, mean
+        # - while flag != success (run qemu thread)
+        # shell = self.shell_class(
+        #    " ".join(self.sub_command), self.timeout, logger=self.logger
+        # )
+        # read flag from qemu results
+        # read flag from shell.logfile
+        # somehow read results from shell
+        # - break
+        # run a new qemu
+        # - success
+        # run new iteration && set flags
 
         shell = self.shell_class(
             " ".join(self.sub_command), self.timeout, logger=self.logger
@@ -523,75 +525,108 @@ class CallQemuAction(Action):
         shell_connection = super().run(shell_connection, max_end_time)
 
         # Inject faults into qemu virtual machine
-        rootfs_url = self.job.parameters['actions'][0]['deploy']['images']['rootfs']['url']
+        rootfs_url = self.job.parameters["actions"][0]["deploy"]["images"]["rootfs"][
+            "url"
+        ]
 
-        fault_inject = self.job.parameters['actions'][1]['boot'].get('fault_inject', {})
-        inject_command = fault_inject.get('commands', [])
-        log_stdout = fault_inject.get('stdout', "/dev/null")
-        log_stderr = fault_inject.get('stderr', "/dev/null")
-        delayed = fault_inject.get('delayed', "")
-        socket_file = fault_inject.get('socket', "")
+        fault_inject = self.job.parameters["actions"][1]["boot"].get("fault_inject", {})
+        inject_command = fault_inject.get("commands", [])
+        log_stdout = fault_inject.get("stdout", "/dev/null")
+        log_stderr = fault_inject.get("stderr", "/dev/null")
+        delayed = fault_inject.get("delayed", "")
+        socket_file = fault_inject.get("socket", "")
         flipshell = []
 
         # sem set
 
         # Are there inject_commands?
         if inject_command != []:
-            # Yes, parse inject_command 
+            # Yes, parse inject_command
 
-            # construct flipshell to inject faults 
+            # construct flipshell to inject faults
             if not Path("/root/flipgdb/fliputils.py").exists():
                 self.logger.debug("/root/flipgdb/fliputils.py not exist")
             elif shutil.which("gdb-multiarch") == None:
                 self.logger.debug("Executable gdb-multiarch is not found")
             else:
-                flipshell.extend([
-                    "gdb-multiarch",
-                    "-q",
-                    "-batch",
-                    "-ex","set pagination off",
-                    "-ex","target remote:1234",
-                    "-ex","maintenance packet Qqemu.PhyMemMode:1",
-                    "-ex","source /root/flipgdb/fliputils.py",
-                ])
+                flipshell.extend(
+                    [
+                        "gdb-multiarch",
+                        "-q",
+                        "-batch",
+                        "-ex",
+                        "set pagination off",
+                        "-ex",
+                        "target remote:1234",
+                        "-ex",
+                        "maintenance packet Qqemu.PhyMemMode:1",
+                        "-ex",
+                        "source /root/flipgdb/fliputils.py",
+                    ]
+                )
                 fault_number = 0
                 for cmd in inject_command:
-                    if cmd.strip().startswith("snapinject") or cmd.strip().startswith("autoinject"):
+                    if cmd.strip().startswith("snapinject") or cmd.strip().startswith(
+                        "autoinject"
+                    ):
                         fault_number += int(cmd.split()[1])
-                    if cmd.strip().startswith("snapinject") and not rootfs_url.endswith("qcow2"):
+                    if cmd.strip().startswith("snapinject") and not rootfs_url.endswith(
+                        "qcow2"
+                    ):
                         self.logger.error("Image type is not qcow2")
                     else:
                         flipshell.extend(["-ex", cmd])
                 try:
-                    os.makedirs('/tmp/' + str(self.job.job_id))
+                    os.makedirs("/tmp/" + str(self.job.job_id))
                 except FileExistsError:
-                    self.logger.error('Dir /tmp/' + str(self.job.job_id) + 'already existed')
-                with open("/tmp/" + str(self.job.job_id) + "/fault_number.txt", "w") as f:
+                    self.logger.error(
+                        "Dir /tmp/" + str(self.job.job_id) + "already existed"
+                    )
+                with open(
+                    "/tmp/" + str(self.job.job_id) + "/fault_number.txt", "w"
+                ) as f:
                     f.write(str(fault_number))
                 # Add detach and quit to make sure qemu continue
                 flipshell.extend(["-ex", "detach", "-ex", "quit"])
-            
+
             # create a client connected to qemu qmp server to read the panic event and count it
             cmd_list = " ".join(self.sub_command).split(" ")
-            kernel_file = cmd_list[cmd_list.index('-kernel') + 1]
-            if subprocess.run(['sh', '/root/check-pvpanic', kernel_file]).returncode != 0:
+            kernel_file = cmd_list[cmd_list.index("-kernel") + 1]
+            if (
+                subprocess.run(["sh", "/root/check-pvpanic", kernel_file]).returncode
+                != 0
+            ):
                 # Kernel should open 'ikconfig', 'pvpanic_pci' and 'pvpanic' config,
                 # because driver 'pvpanic-pci' is necessary to get panic event in qemu,
-                # and 'ikconfig' is necessary to check whether the pvpanic-pci config is choosen
+                # and 'ikconfig' is necessary to check whether the pvpanic-pci config is chosen
                 self.logger.error("pvpanic_pci and pvpanic config not set")
-            elif '-qmp' not in cmd_list or 'pvpanic-pci' not in cmd_list or 'shutdown=pause,panic=none' not in cmd_list or '-s' not in cmd_list:
+            elif (
+                "-qmp" not in cmd_list
+                or "pvpanic-pci" not in cmd_list
+                or "shutdown=pause,panic=none" not in cmd_list
+                or "-s" not in cmd_list
+            ):
                 # qemu boot option is not correct, we need '-device pvpanic-pci', '-qmp unix:/tmp/qmp.sock,server=off,wait=no', '-action shutdown=pause,panic=none' and '-s'
-                self.logger.error('Qemu boot options do not support panic count.')
+                self.logger.error("Qemu boot options do not support panic count.")
             else:
                 try:
                     socket_client = SocketClient(socket_file, self.logger, shell)
-                    threading.Thread(target=panic_count, args=(socket_client,self.job.job_id)).start()
+                    threading.Thread(
+                        target=panic_count, args=(socket_client, self.job.job_id)
+                    ).start()
                     self.logger.debug("panic count thread started")
                 except Exception as e:
                     self.logger.error("Count panic got exception: %s", str(e))
-        
+
             if delayed != "":
-                timer = TimerWithCallback(parse_time_string(delayed), fault_inject_callback, flipshell, log_stdout, log_stderr, self.logger)
+                timer = TimerWithCallback(
+                    parse_time_string(delayed),
+                    fault_inject_callback,
+                    flipshell,
+                    log_stdout,
+                    log_stderr,
+                    self.logger,
+                )
                 timer.start()
             else:
                 fault_inject_callback(flipshell, log_stdout, log_stderr, self.logger)
@@ -607,44 +642,48 @@ class CallQemuAction(Action):
             self.logger.info("Stopping the qemu container %s", self.docker.__name__)
             self.docker.destroy()
 
+
 def fault_inject_callback(flipshell, log_stdout, log_stderr, logger):
     with open(log_stdout, "w") as stdout, open(log_stderr, "w") as stderr:
         subprocess.Popen(flipshell, stdout=stdout, stderr=stderr)
     logger.debug("Spawn a thread to inject faults, Command is %s", flipshell)
 
+
 def parse_time_string(time_str):
     """
     Parse time string to second float number
-    
+
     :param time_str: time string, like '1s', '2ms', '3us'
     :return: second float number
     """
-    
-    match = re.match(r'(\d+)(s|ms|us)', time_str.strip())
-    
+
+    match = re.match(r"(\d+)(s|ms|us)", time_str.strip())
+
     if not match:
         raise ValueError(f"Invalid time string: {time_str}")
-    
-    value = int(match.group(1))  
-    unit = match.group(2)        
 
-    if unit == 's':
-        return value  
-    elif unit == 'ms':
-        return value * 1e-3  
-    elif unit == 'us':
-        return value * 1e-6 
+    value = int(match.group(1))
+    unit = match.group(2)
+
+    if unit == "s":
+        return value
+    elif unit == "ms":
+        return value * 1e-3
+    elif unit == "us":
+        return value * 1e-6
+
 
 def panic_count(socket_client: SocketClient, job_id: int):
     socket_client.send('{"execute": "qmp_capabilities"}')
     socket_client.listen()
     # logger has already released here after socket_client disconnected to QEMU
     # store the results to file
-    os.makedirs('/tmp' + str(job_id), exist_ok=True)
-    with open('/tmp/' + str(job_id) + '/panic_count.txt', 'w') as f:
+    os.makedirs("/tmp" + str(job_id), exist_ok=True)
+    with open("/tmp/" + str(job_id) + "/panic_count.txt", "w") as f:
         f.write(str(socket_client.panic))
         f.flush()
     del socket_client
+
 
 def parse_json_objects(buffer):
     results = []
@@ -654,8 +693,9 @@ def parse_json_objects(buffer):
             results.append(obj)
             buffer = buffer[idx:].lstrip()  # remove parsed part
         except json.JSONDecodeError:
-            # partical data, receive next time.
+            # partial data, receive next time.
             break
     return results, buffer
+
 
 # FIXME: implement a QEMU protocol to monitor VM boots

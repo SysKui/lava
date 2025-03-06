@@ -5,13 +5,14 @@
 #
 # SPDX-License-Identifier: GPL-2.0-or-later
 
-from voluptuous import Msg, Optional, Required, All
+from voluptuous import All, Msg, Optional, Required
 
 from lava_common.schemas import boot, docker
 
 
 def qemu_docker():
     return {**docker(), Optional("binary"): str}
+
 
 def qemu_fault_inject():
     return {
@@ -21,7 +22,7 @@ def qemu_fault_inject():
         Optional("delayed"): str,
         Optional("socket"): str,
     }
-    
+
 
 def schema():
     base = {
