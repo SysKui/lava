@@ -92,10 +92,13 @@ class TimerWithCallback():
             self.timer.cancel()
 
 class SocketClient:
-    def __init__(self, server_address, logger):
+    def __init__(self, server_address, logger, shell):
         """:param server_address: socket file path"""
         # store qemu panic count
         self.panic = 0
+
+        # store pexcept.spawn class to interact with qemu
+        self.shell = shell
 
         # set lava logger
         self.logger = logger
@@ -136,20 +139,23 @@ class SocketClient:
         self.logger.debug("check if port 2222 is listened")
         while not is_port_listening(host, port):
             pass
+        self.logger.debug("port 2222 is listened")
 
         # Use ssh to detect the qemu is already booted
         self.logger.debug("check if the qemu is already booted")
+
         # TODO: use other way to check if the ssh is usable in object machine
         ssh = pexpect.spawn("ssh -p 2222 -o StrictHostKeyChecking=no root@localhost")
-        logfile = open("/root/sshlogfile.txt", "wb")
+        logfile = open("/tmp/sshlogfile.txt", "wb")
         ssh.logfile = logfile
         # TODO: use prompt in yaml to login
-        ssh.expect("root@localhost's password: ", timeout=60)
+        ssh.expect("root@localhost's password: ", timeout=600)
         ssh.sendline("519ailab")
         ssh.expect("root@raspberrypi:~# ")
         ssh.sendline('exit')
         ssh.close()
         logfile.close()
+        self.logger.debug("qemu is already booted")
 
         # Use monitor to create a snapshot
         monitor = pexpect.spawn("telnet localhost 4444")
@@ -175,12 +181,17 @@ class SocketClient:
             results, buffer = parse_json_objects(buffer)
             for res in results:
                 if res.get("event", "") == "GUEST_PANICKED":
-                    self.logger.debug("qemu panic!")
                     self.panic += 1
+                    self.logger.debug("qemu panic! panic count: %d", self.panic)
                     # Panic now, back to snapshot
                     monitor.expect("\(qemu\) ")
                     monitor.sendline("loadvm " + self.snapshot_name)
-                    self.logger.debug("loadvm %s", self.snapshot_name)
+                    # FIXME: After loadvm, test shell connection is broken because except 
+                    # can not match prompt anymore.
+                    self.logger.debug("loadvm %s finished", self.snapshot_name)
+                    # send enter to qemu when it restore to match pexpect prompt
+                    self.shell.send("\r")
+                    self.logger.debug("Already sended enter to qemu")
     
     def __del__(self):
         """Clean the socket"""
@@ -538,10 +549,10 @@ class CallQemuAction(Action):
                     "gdb-multiarch",
                     "-q",
                     "-batch",
-                    "-ex","'set pagination off'",
-                    "-ex","'target remote:1234'",
-                    "-ex","'maintenance packet Qqemu.PhyMemMode:1'",
-                    "-ex","'source /root/flipgdb/fliputils.py'",
+                    "-ex","set pagination off",
+                    "-ex","target remote:1234",
+                    "-ex","maintenance packet Qqemu.PhyMemMode:1",
+                    "-ex","source /root/flipgdb/fliputils.py",
                 ])
                 fault_number = 0
                 for cmd in inject_command:
@@ -551,28 +562,33 @@ class CallQemuAction(Action):
                         self.logger.error("Image type is not qcow2")
                     else:
                         flipshell.extend(["-ex", cmd])
-                with open("/tmp/fault_number.txt", "w") as f:
+                try:
+                    os.makedirs('/tmp/' + str(self.job.job_id))
+                except FileExistsError:
+                    self.logger.error('Dir /tmp/' + str(self.job.job_id) + 'already existed')
+                with open("/tmp/" + str(self.job.job_id) + "/fault_number.txt", "w") as f:
                     f.write(str(fault_number))
                 # Add detach and quit to make sure qemu continue
                 flipshell.extend(["-ex", "detach", "-ex", "quit"])
             
             # create a client connected to qemu qmp server to read the panic event and count it
-            # cmd_list = " ".join(self.sub_command).split(" ")
-            # kernel_file = cmd_list[cmd_list.index('-kernel') + 1]
-            # if subprocess.run(['sh', '/root/check-pvpanic', kernel_file]).returncode != 0:
-            #     # kernel should open pvpanic_pci and pvpanic config,
-            #     # because driver pvpanic-pci is necessary to get panic event in qemu
-            #     self.logger.error("pvpanic_pci and pvpanic config not set")
-            # elif '-qmp' not in cmd_list or 'pvpanic-pci' not in cmd_list or 'shutdown=pause,panic=none' not in cmd_list or '-s' not in cmd_list:
-            #     # qemu boot option is not correct, we need '-device pvpanic-pci', '-qmp unix:/tmp/qmp.sock,server=off,wait=no', '-action shutdown=pause,panic=none' and '-s'
-            #     self.logger.error('Qemu boot options do not support panic count.')
-            # else:
-            #     try:
-            #         socket_client = SocketClient(socket_file, self.logger)
-            #         threading.Thread(target=panic_count, args=(socket_client, self.logger)).start()
-            #         self.logger.debug("panic count thread started")
-            #     except Exception as e:
-            #         self.logger.error("Count panic got exception: %s", str(e))
+            cmd_list = " ".join(self.sub_command).split(" ")
+            kernel_file = cmd_list[cmd_list.index('-kernel') + 1]
+            if subprocess.run(['sh', '/root/check-pvpanic', kernel_file]).returncode != 0:
+                # Kernel should open 'ikconfig', 'pvpanic_pci' and 'pvpanic' config,
+                # because driver 'pvpanic-pci' is necessary to get panic event in qemu,
+                # and 'ikconfig' is necessary to check whether the pvpanic-pci config is choosen
+                self.logger.error("pvpanic_pci and pvpanic config not set")
+            elif '-qmp' not in cmd_list or 'pvpanic-pci' not in cmd_list or 'shutdown=pause,panic=none' not in cmd_list or '-s' not in cmd_list:
+                # qemu boot option is not correct, we need '-device pvpanic-pci', '-qmp unix:/tmp/qmp.sock,server=off,wait=no', '-action shutdown=pause,panic=none' and '-s'
+                self.logger.error('Qemu boot options do not support panic count.')
+            else:
+                try:
+                    socket_client = SocketClient(socket_file, self.logger, shell)
+                    threading.Thread(target=panic_count, args=(socket_client,self.job.job_id)).start()
+                    self.logger.debug("panic count thread started")
+                except Exception as e:
+                    self.logger.error("Count panic got exception: %s", str(e))
         
             if delayed != "":
                 timer = TimerWithCallback(parse_time_string(delayed), fault_inject_callback, flipshell, log_stdout, log_stderr, self.logger)
@@ -619,13 +635,15 @@ def parse_time_string(time_str):
     elif unit == 'us':
         return value * 1e-6 
 
-def panic_count(socket_client: SocketClient, logger):
+def panic_count(socket_client: SocketClient, job_id: int):
     socket_client.send('{"execute": "qmp_capabilities"}')
     socket_client.listen()
     # logger has already released here after socket_client disconnected to QEMU
     # store the results to file
-    with open('/tmp/panic_count.txt', 'w') as f:
+    os.makedirs('/tmp' + str(job_id), exist_ok=True)
+    with open('/tmp/' + str(job_id) + '/panic_count.txt', 'w') as f:
         f.write(str(socket_client.panic))
+        f.flush()
     del socket_client
 
 def parse_json_objects(buffer):
