@@ -5,6 +5,8 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 from __future__ import annotations
 
+
+import time
 import json
 import os
 import re
@@ -106,6 +108,7 @@ class SocketClient:
         self.logger = logger
 
         # tmp snapshot
+        # 这行代码的作用是 ​​生成一个基于 UUID v5 的唯一快照名称​​，结合了动态的 UUID v1 和固定的命名空间字符串 "lava"
         self.snapshot_name = uuid.uuid5(uuid.uuid1(), "lava").hex
 
         # unix domain sockets
@@ -126,9 +129,10 @@ class SocketClient:
     def listen(self):
         """Listen the socket server and get the response"""
 
+        # 判断下是否能够
         def is_port_listening(host, port):
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(1)  # 设置超时
+            sock.settimeout(1)  # 设置超时，1秒
             try:
                 sock.connect((host, port))
             except (socket.timeout, socket.error):
@@ -136,7 +140,7 @@ class SocketClient:
             return True
 
         host = "localhost"
-        port = 2222
+        port = 2222  # user,hostfwd=::2222-:22  将guest内部的22端口映射到host的2222端口  
 
         self.logger.debug("check if port 2222 is listened")
         while not is_port_listening(host, port):
@@ -160,6 +164,7 @@ class SocketClient:
         self.logger.debug("qemu is already booted")
 
         # Use monitor to create a snapshot
+        # 连接qemu的monitor，并保存快照
         monitor = pexpect.spawn("telnet localhost 4444")
         monitor.expect("\(qemu\) ")
         monitor.sendline("savevm " + self.snapshot_name)
@@ -168,6 +173,7 @@ class SocketClient:
         buffer = ""
         while True:
             data = self.sock.recv(1024)
+            # 没有数据了，清理快照
             if not data:
                 # qemu already close, clean the snapshot
                 monitor.expect("\(qemu\) ")
@@ -179,7 +185,7 @@ class SocketClient:
                 break
             # there maybe more than one object in data. one object per line.
             # use parse function to parse the json objects
-            buffer += data.decode()
+            buffer += data.decode()   # 把收到的字节数据转成字符串,拼接进 `buffer` 缓冲区，准备处理可能的多条 JSON
             results, buffer = parse_json_objects(buffer)
             for res in results:
                 if res.get("event", "") == "GUEST_PANICKED":
@@ -192,6 +198,7 @@ class SocketClient:
                     # can not match prompt anymore.
                     self.logger.debug("loadvm %s finished", self.snapshot_name)
                     # send enter to qemu when it restore to match pexpect prompt
+                    # 加载快照后，QEMU 控制台可能卡在旧的 prompt 输出上，导致后续 LAVA 无法匹配 shell 提示符。
                     self.shell.send("\r")
                     self.logger.debug("Already sended enter to qemu")
 
@@ -199,6 +206,124 @@ class SocketClient:
         """Clean the socket"""
         self.sock.close()
 
+
+# 注入用户态使用的socket类
+class SocketClient_app:
+    def __init__(self,sever_address, logger, app_command, flipshell, log_stdout, log_stderr):
+
+        self.flipshell = flipshell
+        self.log_stdout = log_stdout
+        self.log_stderr = log_stderr
+        self.logger = logger
+        self.appcommand = "nohup bash guest_send.sh "+app_command+" > /tmp/guest.log 2>&1 &"
+        # virtio-serial-pci socket
+        self.sever_address = sever_address
+        socket_family = socket.AF_UNIX
+        socket_type = socket.SOCK_STREAM
+
+        self.sock = socket.socket(socket_family,socket_type)
+
+        # try:
+        #     self.sock.connect(self.sever_address)
+        # except Exception as e:
+        #     raise e
+    
+    def run_flipshell(self):
+        with open(self.log_stdout, "w") as stdout, open(self.log_stderr, "w") as stderr:
+            subprocess.Popen(self.flipshell, stdout=stdout, stderr=stderr)
+        self.logger.debug("Spawn a thread to inject faults, Command is %s", self.flipshell)
+
+    def listen(self):
+        """Listen the socket server and get the response"""
+
+        def is_port_listening(host,port):
+            sock = socket.socket(socket.AF_INET,socket.SOCK_STREAM)
+            sock.settimeout(1)
+
+            try:
+                sock.connect((host,port))
+            except (socket.timeout,socket.error):
+                return False
+
+            return True
+        
+        host = "localhost"
+        port = 2222
+
+        self.logger.debug("check if port 2222 is listened")
+
+        while not is_port_listening(host,port):
+            pass
+        
+        self.logger.debug("port 2222 is listened")
+
+        # detech the qemu
+        self.logger.debug("check if the qemu is already booted")
+
+        # scp -P 2222 -o StrictHostKeyChecking=no root@localhost:/mnt/shared/flip_simulation/output.log /home/zhy/find_process/virti_pci_test/
+        max_retries = 3  # Retry at most 2 time (i.e. 3 attempts in total)
+        retry_delay = 5  # Retry interval (seconds)
+
+        for attempt in range(max_retries + 1): 
+            try:
+                ssh = pexpect.spawn("ssh -p 2222 -o StrictHostKeyChecking=no root@localhost")
+                logfile = open("/tmp/sshlogfile.txt", "wb")
+                ssh.logfile = logfile
+
+                # TODO: login via the prompt in the yaml 
+                ssh.expect("root@localhost's password: ", timeout=600)
+                ssh.sendline("519ailab")
+                ssh.expect("root@raspberrypi:~# ")
+                ssh.sendline(self.appcommand)
+                ssh.expect("root@raspberrypi:~# ")
+                ssh.sendline("exit")
+                ssh.close()
+                logfile.close()
+                break  
+
+            except (pexpect.EOF, pexpect.TIMEOUT) as e:
+                self.logger.debug(f"Attempt {attempt + 1} failed: {str(e)}")
+                if ssh and not ssh.closed:
+                    ssh.close()
+                if 'logfile' in locals() and not logfile.closed:
+                    logfile.close()
+                
+                if attempt < max_retries:
+                    self.logger.debug(f"Retrying in {retry_delay} seconds...")
+                    time.sleep(retry_delay)
+                else:
+                    self.logger.debug("Max retries reached. Giving up.")
+                    raise  
+   
+        # The client has written to the socket and started listening to the host's socket
+        self.logger.debug("Connecting to local socket and waiting for guest signal...")
+
+        try:
+            self.sock.connect(self.sever_address)
+            self.sock.settimeout(60)
+            data = self.sock.recv(1024)
+            self.logger.debug("Socket recv signal")
+            scp = pexpect.spawn("scp -P 2222 -o StrictHostKeyChecking=no root@localhost:/root/output.log /root/")
+            # TODO: login via the prompt in the yaml 
+            scp.expect("root@localhost's password: ", timeout=600)
+            scp.sendline("519ailab")
+            scp.expect(pexpect.EOF)
+            scp.close()
+            self.run_flipshell()
+        except socket.timeout:
+            self.logger.warning("Socket recv timeout, no data received")
+
+        except Exception as e:
+            self.logger.error(f"Socket error: {e}")
+
+        
+    
+    def __del__(self):
+        """Clean the socket"""
+        self.sock.close()
+
+
+        
 
 class CallQemuAction(Action):
     name = "execute-qemu"
@@ -525,24 +650,35 @@ class CallQemuAction(Action):
         shell_connection = super().run(shell_connection, max_end_time)
 
         # Inject faults into qemu virtual machine
+        # Get the file system path
         rootfs_url = self.job.parameters["actions"][0]["deploy"]["images"]["rootfs"][
             "url"
         ]
 
         fault_inject = self.job.parameters["actions"][1]["boot"].get("fault_inject", {})
+        # Returns the injected command, otherwise returns an empty list
         inject_command = fault_inject.get("commands", [])
+        # stdout: /tmp/test.out
         log_stdout = fault_inject.get("stdout", "/dev/null")
+        # stderr: /tmp/test.err
         log_stderr = fault_inject.get("stderr", "/dev/null")
+        # Add a delay option
         delayed = fault_inject.get("delayed", "")
+        # socket: /tmp/qmp.sock
         socket_file = fault_inject.get("socket", "")
+        # /tmp/vm_sync_signal
+        socket_app_file = fault_inject.get("socket_app","")
+        # User startup command
+        app_start_command = fault_inject.get("start_command","")
+
         flipshell = []
 
         # sem set
-
+        
         # Are there inject_commands?
         if inject_command != []:
             # Yes, parse inject_command
-
+            appinject_flag = 0
             # construct flipshell to inject faults
             if not Path("/root/flipgdb/fliputils.py").exists():
                 self.logger.debug("/root/flipgdb/fliputils.py not exist")
@@ -564,18 +700,25 @@ class CallQemuAction(Action):
                         "source /root/flipgdb/fliputils.py",
                     ]
                 )
+                # 定义注入次数
                 fault_number = 0
+                # Determine whether appinject is used
                 for cmd in inject_command:
+                    if cmd.strip().startswith("appinject"):
+                        appinject_flag = 1
                     if cmd.strip().startswith("snapinject") or cmd.strip().startswith(
                         "autoinject"
-                    ):
+                    )or cmd.strip().startswith("appinject"):
                         fault_number += int(cmd.split()[1])
                     if cmd.strip().startswith("snapinject") and not rootfs_url.endswith(
                         "qcow2"
                     ):
                         self.logger.error("Image type is not qcow2")
                     else:
-                        flipshell.extend(["-ex", cmd])
+                        if appinject_flag == 1:
+                            flipshell.extend(["-ex", cmd+" /root/output.log"])
+                        else:
+                            flipshell.extend(["-ex", cmd])
                 try:
                     os.makedirs("/tmp/" + str(self.job.job_id))
                 except FileExistsError:
@@ -618,18 +761,28 @@ class CallQemuAction(Action):
                 except Exception as e:
                     self.logger.error("Count panic got exception: %s", str(e))
 
-            if delayed != "":
-                timer = TimerWithCallback(
-                    parse_time_string(delayed),
-                    fault_inject_callback,
-                    flipshell,
-                    log_stdout,
-                    log_stderr,
-                    self.logger,
-                )
-                timer.start()
+            
+            if appinject_flag == 1:
+                try:
+                    socket_client_app = SocketClient_app(socket_app_file,self.logger,app_start_command,flipshell,log_stdout,log_stderr)
+                    threading.Thread(target=app_inject,args=(socket_client_app,)).start()
+                    self.logger.debug("Appinject thread started")
+                except Exception as e:
+                    self.logger.error("Appinject got exception: %s", str(e))
             else:
-                fault_inject_callback(flipshell, log_stdout, log_stderr, self.logger)
+                # Delayed execution of the inject action
+                if delayed != "":
+                    timer = TimerWithCallback(
+                        parse_time_string(delayed), 
+                        fault_inject_callback, 
+                        flipshell,
+                        log_stdout,
+                        log_stderr,
+                        self.logger,
+                    )
+                    timer.start()
+                else:
+                    fault_inject_callback(flipshell, log_stdout, log_stderr, self.logger)
 
         self.set_namespace_data(
             action="shared", label="shared", key="connection", value=shell_connection
@@ -647,6 +800,7 @@ def fault_inject_callback(flipshell, log_stdout, log_stderr, logger):
     with open(log_stdout, "w") as stdout, open(log_stderr, "w") as stderr:
         subprocess.Popen(flipshell, stdout=stdout, stderr=stderr)
     logger.debug("Spawn a thread to inject faults, Command is %s", flipshell)
+
 
 
 def parse_time_string(time_str):
@@ -684,6 +838,9 @@ def panic_count(socket_client: SocketClient, job_id: int):
         f.flush()
     del socket_client
 
+def app_inject(socket_client: SocketClient_app):
+    socket_client.listen()
+    del socket_client
 
 def parse_json_objects(buffer):
     results = []
@@ -691,7 +848,7 @@ def parse_json_objects(buffer):
         try:
             obj, idx = json.JSONDecoder().raw_decode(buffer)
             results.append(obj)
-            buffer = buffer[idx:].lstrip()  # remove parsed part
+            buffer = buffer[idx:].lstrip()  # remove parsed part   .lstrip()去掉前导空白
         except json.JSONDecodeError:
             # partial data, receive next time.
             break
