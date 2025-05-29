@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import pexpect
+import argparse
 
 from lava_common.constants import DISPATCHER_DOWNLOAD_DIR, SYS_CLASS_KVM
 from lava_common.exceptions import JobError
@@ -674,7 +675,7 @@ class CallQemuAction(Action):
         # Are there inject_commands?
         if inject_command != []:
             # Yes, parse inject_command
-            appinject_flag = 0
+            is_appinject = False
             # construct flipshell to inject faults
             if not Path("/root/flipgdb/fliputils.py").exists():
                 self.logger.debug("/root/flipgdb/fliputils.py not exist")
@@ -689,31 +690,32 @@ class CallQemuAction(Action):
                         "-ex",
                         "set pagination off",
                         "-ex",
-                        "target remote:1234",
-                        "-ex",
                         "maintenance packet Qqemu.PhyMemMode:1",
-                        "-ex",
-                        "source /root/flipgdb/fliputils.py",
                     ]
                 )
-                # TODO: fault inject numbers should be determined in yaml file by user.
-                # 定义注入次数
+                
                 fault_number = 0
                 # Determine whether appinject is used
+                # TODO: Use argparse to parse the param, not parse by the index.
                 for cmd in inject_command:
                     if cmd.strip().startswith("appinject"):
-                        # TODO: Rename to is_appinject, use bool
-                        appinject_flag = 1
+                        is_appinject = True
                     if cmd.strip().startswith("snapinject") or cmd.strip().startswith(
                         "autoinject"
                     )or cmd.strip().startswith("appinject"):
-                        fault_number += int(cmd.split()[1])
+                        # sum fault numbers
+                        args = argparse.ArgumentParser()
+                        args.add_argument("--total-fault-number")
+                        parsed = args.parse_args(cmd)
+                        self.logger.info(f"fault number add: {parsed.total_fault_number}")
+                        fault_number += int(parsed.total_fault_number)
+                        self.logger.info(f"Current fault number: {fault_number}")
                     if cmd.strip().startswith("snapinject") and not rootfs_url.endswith(
                         "qcow2"
                     ):
                         self.logger.error("Image type is not qcow2")
                     else:
-                        if appinject_flag == 1:
+                        if is_appinject:
                             # TODO: path to store log should be specify by user
                             flipshell.extend(["-ex", cmd+" /root/output.log"])
                         else:
@@ -763,7 +765,7 @@ class CallQemuAction(Action):
                     self.logger.error("Count panic got exception: %s", str(e))
 
             
-            if appinject_flag == 1:
+            if is_appinject:
                 try:
                     socket_client_app = SocketClient_app(socket_app_file,self.logger,app_start_command,flipshell,log_stdout,log_stderr,
                                                          port=fault_inject.get("port", "1234"), host=fault_inject.get("host", "localhost"),
