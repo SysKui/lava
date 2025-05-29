@@ -23,6 +23,9 @@ def qemu_fault_inject():
         Optional("socket"): str,
         Optional("socket_app"):str,
         Optional("start_command"):str,
+        Optional("port"): str,
+        Optional("host"): str,
+        Optional("guest_send_path"): str
     }
 
 

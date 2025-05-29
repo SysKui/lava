@@ -97,7 +97,11 @@ class TimerWithCallback:
 
 class SocketClient:
     def __init__(self, server_address, logger, shell):
-        """:param server_address: socket file path"""
+        """
+        :param server_address: socket file path
+        :param logger: lava logger
+        :param shell: pexcept.spawn shell
+        """
         # store qemu panic count
         self.panic = 0
 
@@ -165,6 +169,7 @@ class SocketClient:
 
         # Use monitor to create a snapshot
         # 连接qemu的monitor，并保存快照
+        # TODO: no need to use telnet here, gdb server can do so, like `(gdb) monitor savevm <name>`
         monitor = pexpect.spawn("telnet localhost 4444")
         monitor.expect("\(qemu\) ")
         monitor.sendline("savevm " + self.snapshot_name)
@@ -194,11 +199,9 @@ class SocketClient:
                     # Panic now, back to snapshot
                     monitor.expect("\(qemu\) ")
                     monitor.sendline("loadvm " + self.snapshot_name)
-                    # FIXME: After loadvm, test shell connection is broken because except
-                    # can not match prompt anymore.
                     self.logger.debug("loadvm %s finished", self.snapshot_name)
                     # send enter to qemu when it restore to match pexpect prompt
-                    # 加载快照后，QEMU 控制台可能卡在旧的 prompt 输出上，导致后续 LAVA 无法匹配 shell 提示符。
+                    # 加载快照后，QEMU 控制台可能卡在旧的 prompt 输出上，导致后续 LAVA 无法匹配 shell 提示符。这里使用\r让 shell 提示符出现
                     self.shell.send("\r")
                     self.logger.debug("Already sended enter to qemu")
 
@@ -209,13 +212,35 @@ class SocketClient:
 
 # 注入用户态使用的socket类
 class SocketClient_app:
-    def __init__(self,sever_address, logger, app_command, flipshell, log_stdout, log_stderr):
+    def __init__(self, sever_address, logger, app_command, flipshell, log_stdout, log_stderr,
+                 port, host, username, password, prompts, guest_send_path):
+        """
+        :param sever_address: socket file path
+        :param logger: logger to use, commonly is LAVA logger, which can print log to Web
+        :param flipshell: The command to inject faults via gdb
+        :param log_stdout: gdb log stdout
+        :param log_stderr: gdb log stderr
+        :param hots: host for ssh
+        :param port: port for ssh
+        :param username: username for ssh
+        :param password: password for ssh
+        :param prompts: prompts for pexcept
+        :param appcommand: command to launch app that need to inject faults
+        :param guest_send_path: guest_send.sh path in rootfs
+        """
 
         self.flipshell = flipshell
         self.log_stdout = log_stdout
         self.log_stderr = log_stderr
         self.logger = logger
-        self.appcommand = "nohup bash guest_send.sh "+app_command+" > /tmp/guest.log 2>&1 &"
+        self.host = host
+        self.port = port
+        self.username = username
+        self.password = password
+        self.prompts = prompts
+        self.guest_send_path = guest_send_path
+        # TODO: guest_send.sh should store out of guest rootfs
+        self.appcommand = f"nohup bash {self.guest_send_path} {app_command} > /tmp/guest.log 2>&1 &"
         # virtio-serial-pci socket
         self.sever_address = sever_address
         socket_family = socket.AF_UNIX
@@ -246,36 +271,30 @@ class SocketClient_app:
                 return False
 
             return True
-        
-        host = "localhost"
-        port = 2222
 
-        self.logger.debug("check if port 2222 is listened")
+        self.logger.debug(f"check if port {self.port} is listened")
 
-        while not is_port_listening(host,port):
+        while not is_port_listening(self.host, self.port):
             pass
         
-        self.logger.debug("port 2222 is listened")
+        self.logger.debug(f"port {self.port} is listened")
 
         # detech the qemu
         self.logger.debug("check if the qemu is already booted")
 
-        # scp -P 2222 -o StrictHostKeyChecking=no root@localhost:/mnt/shared/flip_simulation/output.log /home/zhy/find_process/virti_pci_test/
         max_retries = 3  # Retry at most 2 time (i.e. 3 attempts in total)
         retry_delay = 5  # Retry interval (seconds)
 
         for attempt in range(max_retries + 1): 
             try:
-                ssh = pexpect.spawn("ssh -p 2222 -o StrictHostKeyChecking=no root@localhost")
+                ssh = pexpect.spawn(f"ssh -p {self.port} -o StrictHostKeyChecking=no {self.username}@{self.host}")
                 logfile = open("/tmp/sshlogfile.txt", "wb")
                 ssh.logfile = logfile
-
-                # TODO: login via the prompt in the yaml 
-                ssh.expect("root@localhost's password: ", timeout=600)
-                ssh.sendline("519ailab")
-                ssh.expect("root@raspberrypi:~# ")
+                ssh.expect(f"{self.username}@{self.host}'s password: ", timeout=600)
+                ssh.sendline(str(self.password))
+                ssh.expect(f"{self.prompts}")
                 ssh.sendline(self.appcommand)
-                ssh.expect("root@raspberrypi:~# ")
+                ssh.expect(f"{self.prompts}")
                 ssh.sendline("exit")
                 ssh.close()
                 logfile.close()
@@ -303,10 +322,9 @@ class SocketClient_app:
             self.sock.settimeout(60)
             data = self.sock.recv(1024)
             self.logger.debug("Socket recv signal")
-            scp = pexpect.spawn("scp -P 2222 -o StrictHostKeyChecking=no root@localhost:/root/output.log /root/")
-            # TODO: login via the prompt in the yaml 
-            scp.expect("root@localhost's password: ", timeout=600)
-            scp.sendline("519ailab")
+            scp = pexpect.spawn(f"scp -P {self.port} -o StrictHostKeyChecking=no {self.username}@{self.host}:/root/output.log /root/")
+            ssh.expect(f"{self.username}@{self.host}'s password: ", timeout=600)
+            scp.sendline(str(self.password))
             scp.expect(pexpect.EOF)
             scp.close()
             self.run_flipshell()
@@ -315,15 +333,10 @@ class SocketClient_app:
 
         except Exception as e:
             self.logger.error(f"Socket error: {e}")
-
-        
     
     def __del__(self):
         """Clean the socket"""
         self.sock.close()
-
-
-        
 
 class CallQemuAction(Action):
     name = "execute-qemu"
@@ -620,23 +633,6 @@ class CallQemuAction(Action):
 
         self.logger.info("Boot command: %s", " ".join(self.sub_command))
         # ShellCommand init, pexpect.spawn class create, qemu start here.
-
-        # split normal CI task and SEU test task
-        # new_moniter_thread();
-        # - sem
-        # - parameters: 1000 times, mean
-        # - while flag != success (run qemu thread)
-        # shell = self.shell_class(
-        #    " ".join(self.sub_command), self.timeout, logger=self.logger
-        # )
-        # read flag from qemu results
-        # read flag from shell.logfile
-        # somehow read results from shell
-        # - break
-        # run a new qemu
-        # - success
-        # run new iteration && set flags
-
         shell = self.shell_class(
             " ".join(self.sub_command), self.timeout, logger=self.logger
         )
@@ -656,6 +652,8 @@ class CallQemuAction(Action):
         ]
 
         fault_inject = self.job.parameters["actions"][1]["boot"].get("fault_inject", {})
+        prompts = self.job.parameters["actions"][1]["boot"].get("prompts", [])[0]
+        password = self.job.parameters["actions"][1]["boot"].get("auto_login", {}).get("password", "519ailab")
         # Returns the injected command, otherwise returns an empty list
         inject_command = fault_inject.get("commands", [])
         # stdout: /tmp/test.out
@@ -672,8 +670,6 @@ class CallQemuAction(Action):
         app_start_command = fault_inject.get("start_command","")
 
         flipshell = []
-
-        # sem set
         
         # Are there inject_commands?
         if inject_command != []:
@@ -700,11 +696,13 @@ class CallQemuAction(Action):
                         "source /root/flipgdb/fliputils.py",
                     ]
                 )
+                # TODO: fault inject numbers should be determined in yaml file by user.
                 # 定义注入次数
                 fault_number = 0
                 # Determine whether appinject is used
                 for cmd in inject_command:
                     if cmd.strip().startswith("appinject"):
+                        # TODO: Rename to is_appinject, use bool
                         appinject_flag = 1
                     if cmd.strip().startswith("snapinject") or cmd.strip().startswith(
                         "autoinject"
@@ -716,6 +714,7 @@ class CallQemuAction(Action):
                         self.logger.error("Image type is not qcow2")
                     else:
                         if appinject_flag == 1:
+                            # TODO: path to store log should be specify by user
                             flipshell.extend(["-ex", cmd+" /root/output.log"])
                         else:
                             flipshell.extend(["-ex", cmd])
@@ -743,6 +742,8 @@ class CallQemuAction(Action):
                 # because driver 'pvpanic-pci' is necessary to get panic event in qemu,
                 # and 'ikconfig' is necessary to check whether the pvpanic-pci config is chosen
                 self.logger.error("pvpanic_pci and pvpanic config not set")
+
+            # TODO: implement a more roburst command checker here.
             elif (
                 "-qmp" not in cmd_list
                 or "pvpanic-pci" not in cmd_list
@@ -764,7 +765,11 @@ class CallQemuAction(Action):
             
             if appinject_flag == 1:
                 try:
-                    socket_client_app = SocketClient_app(socket_app_file,self.logger,app_start_command,flipshell,log_stdout,log_stderr)
+                    socket_client_app = SocketClient_app(socket_app_file,self.logger,app_start_command,flipshell,log_stdout,log_stderr,
+                                                         port=fault_inject.get("port", "1234"), host=fault_inject.get("host", "localhost"),
+                                                         password=password, 
+                                                         prompts=prompts,
+                                                         guest_send_path=fault_inject.get("guest_send_path", "/root/guest_send.sh"))
                     threading.Thread(target=app_inject,args=(socket_client_app,)).start()
                     self.logger.debug("Appinject thread started")
                 except Exception as e:
