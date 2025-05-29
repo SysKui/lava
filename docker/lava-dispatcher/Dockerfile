@@ -11,6 +11,11 @@ FROM debian:bookworm-slim as build
 ARG lava_version=""
 # Use the CN mirror apt sources
 COPY docker/debian.sources /etc/apt/sources.list.d/debian.sources
+# 设置代理
+ENV http_proxy "http://10.161.28.28:7890"
+ENV HTTP_PROXY "http://10.161.28.28:7890"
+ENV https_proxy "http://10.161.28.28:7890"
+ENV HTTPS_PROXY "http://10.161.28.28:7890"
 RUN apt-get update && \
 apt-get install --no-install-recommends --yes python3 python3-setuptools
 
@@ -33,5 +38,10 @@ RUN mkdir /install/root/entrypoint.d
 # Build the final image
 FROM $base_image as install
 COPY --from=build /install /
+
+ENV http_proxy ""
+ENV HTTP_PROXY ""
+ENV https_proxy ""
+ENV HTTPS_PROXY ""
 
 ENTRYPOINT ["/root/entrypoint.sh"]

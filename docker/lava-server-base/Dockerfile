@@ -4,6 +4,13 @@ LABEL maintainer="Rémi Duraffort <remi.duraffort@linaro.org>"
 
 ENV DEBIAN_FRONTEND noninteractive
 
+
+# 设置代理
+ENV http_proxy "http://10.161.28.28:7890"
+ENV HTTP_PROXY "http://10.161.28.28:7890"
+ENV https_proxy "http://10.161.28.28:7890"
+ENV HTTPS_PROXY "http://10.161.28.28:7890"
+
 RUN echo 'deb http://deb.debian.org/debian bookworm-backports main' > /etc/apt/sources.list.d/backports.list && \
     mkdir -p /usr/share/man/man1 /usr/share/man/man7 && \
     groupadd --system --gid 200 lavaserver && \
@@ -18,3 +25,11 @@ RUN echo 'deb http://deb.debian.org/debian bookworm-backports main' > /etc/apt/s
     python3 -m pip install --break-system-packages django-matomo==0.1.6 django-sync-github-teams==0.1.1 && \
     find /usr/lib/python3/dist-packages/ -name '__pycache__' -type d -exec rm -r "{}" + && \
     rm -rf /var/lib/apt/lists/*
+
+
+    # 下载完取消
+# 取消代理设置
+ENV http_proxy ""
+ENV HTTP_PROXY ""
+ENV https_proxy ""
+ENV HTTPS_PROXY ""
