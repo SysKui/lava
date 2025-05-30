@@ -20,7 +20,6 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import pexpect
-import argparse
 
 from lava_common.constants import DISPATCHER_DOWNLOAD_DIR, SYS_CLASS_KVM
 from lava_common.exceptions import JobError
@@ -677,9 +676,7 @@ class CallQemuAction(Action):
             # Yes, parse inject_command
             is_appinject = False
             # construct flipshell to inject faults
-            if not Path("/root/flipgdb/fliputils.py").exists():
-                self.logger.debug("/root/flipgdb/fliputils.py not exist")
-            elif shutil.which("gdb-multiarch") == None:
+            if shutil.which("gdb-multiarch") == None:
                 self.logger.debug("Executable gdb-multiarch is not found")
             else:
                 flipshell.extend(
@@ -703,12 +700,9 @@ class CallQemuAction(Action):
                     if cmd.strip().startswith("snapinject") or cmd.strip().startswith(
                         "autoinject"
                     )or cmd.strip().startswith("appinject"):
-                        # sum fault numbers
-                        args = argparse.ArgumentParser()
-                        args.add_argument("--total-fault-number")
-                        parsed = args.parse_args(cmd)
-                        self.logger.info(f"fault number add: {parsed.total_fault_number}")
-                        fault_number += int(parsed.total_fault_number)
+                        total_fault_number = int(re.search(r'--total-fault-number\s+(\d+)', cmd).group(1))
+                        self.logger.info(f"fault number add: {total_fault_number}")
+                        fault_number += int(total_fault_number)
                         self.logger.info(f"Current fault number: {fault_number}")
                     if cmd.strip().startswith("snapinject") and not rootfs_url.endswith(
                         "qcow2"
