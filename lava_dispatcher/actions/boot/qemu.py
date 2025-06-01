@@ -14,8 +14,7 @@ import socket
 import subprocess
 import threading
 import time
-import uuid
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, List
 
 import pexpect
 
@@ -81,6 +80,7 @@ class TimerWithCallback:
     def start(self):
         """Start the timer"""
         self.timer = threading.Timer(self.interval, self._run)
+        self.timer.daemon = True
         self.timer.start()
 
     def _run(self):
@@ -109,20 +109,22 @@ class SocketClient:
         # set lava logger
         self.logger = logger
 
-        # tmp snapshot
-        # 这行代码的作用是 ​​生成一个基于 UUID v5 的唯一快照名称​​，结合了动态的 UUID v1 和固定的命名空间字符串 "lava"
-        self.snapshot_name = uuid.uuid5(uuid.uuid1(), "lava").hex
-
         # unix domain sockets
         self.server_address = server_address
         socket_family = socket.AF_UNIX
         socket_type = socket.SOCK_STREAM
 
         self.sock = socket.socket(socket_family, socket_type)
+
+    def connect(self):
         try:
+            self.logger.info(f"SocketClient init: Try connect to {self.server_address}")
             self.sock.connect(self.server_address)
+            self.logger.info(f"SocketClient connect to {self.server_address}")
         except Exception as e:
-            raise e
+            self.logger.error(f"SocketClient init error: {e}")
+            return False
+        return True
 
     def send(self, data: str):
         """Send str to socket server"""
@@ -131,84 +133,47 @@ class SocketClient:
     def listen(self):
         """Listen the socket server and get the response"""
 
-        # 判断下是否能够
-        def is_port_listening(host, port):
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(1)  # 设置超时，1秒
-            try:
-                sock.connect((host, port))
-            except (socket.timeout, socket.error):
-                return False
-            return True
-
-        host = "localhost"
-        port = 2222  # user,hostfwd=::2222-:22  将guest内部的22端口映射到host的2222端口
-
-        self.logger.debug("check if port 2222 is listened")
-        while not is_port_listening(host, port):
-            pass
-        self.logger.debug("port 2222 is listened")
-
-        # Use ssh to detect the qemu is already booted
-        self.logger.debug("check if the qemu is already booted")
-
-        # TODO: use other way to check if the ssh is usable in object machine
-        ssh = pexpect.spawn("ssh -p 2222 -o StrictHostKeyChecking=no root@localhost")
-        logfile = open("/tmp/sshlogfile.txt", "wb")
-        ssh.logfile = logfile
-        # TODO: use prompt in yaml to login
-        ssh.expect("root@localhost's password: ", timeout=600)
-        ssh.sendline("519ailab")
-        ssh.expect("root@raspberrypi:~# ")
-        ssh.sendline("exit")
-        ssh.close()
-        logfile.close()
-        self.logger.debug("qemu is already booted")
-
-        # Use monitor to create a snapshot
-        # 连接qemu的monitor，并保存快照
-        # TODO: no need to use telnet here, gdb server can do so, like `(gdb) monitor savevm <name>`
-        monitor = pexpect.spawn("telnet localhost 4444")
-        monitor.expect("\(qemu\) ")
-        monitor.sendline("savevm " + self.snapshot_name)
-        self.logger.debug("savevm %s", self.snapshot_name)
-
         buffer = ""
-        while True:
-            data = self.sock.recv(1024)
-            # 没有数据了，清理快照
-            if not data:
-                # qemu already close, clean the snapshot
-                monitor.expect("\(qemu\) ")
-                monitor.sendline("delvm " + self.snapshot_name)
-                self.logger.debug("delvm %s", self.snapshot_name)
-                # quit the telnet
-                monitor.close()
-                self.logger.debug("monitor quit")
-                break
-            # there maybe more than one object in data. one object per line.
-            # use parse function to parse the json objects
-            buffer += data.decode()  # 把收到的字节数据转成字符串,拼接进 `buffer` 缓冲区，准备处理可能的多条 JSON
-            results, buffer = parse_json_objects(buffer)
-            for res in results:
-                if res.get("event", "") == "GUEST_PANICKED":
-                    self.panic += 1
-                    self.logger.debug("qemu panic! panic count: %d", self.panic)
-                    # Panic now, back to snapshot
-                    monitor.expect("\(qemu\) ")
-                    monitor.sendline("loadvm " + self.snapshot_name)
-                    self.logger.debug("loadvm %s finished", self.snapshot_name)
-                    # send enter to qemu when it restore to match pexpect prompt
-                    # 加载快照后，QEMU 控制台可能卡在旧的 prompt 输出上，导致后续 LAVA 无法匹配 shell 提示符。这里使用\r让 shell 提示符出现
-                    self.shell.send("\r")
-                    self.logger.debug("Already sended enter to qemu")
+        # Set socket timeout to avoid infinite blocking on recv
+        self.sock.settimeout(5)
+        # Set a total timeout period, listen for maximum 5 minutes
+        max_listen_time = 300  # 5 minutes
+        start_time = time.time()
+
+        try:
+            while time.time() - start_time < max_listen_time:
+                try:
+                    data = self.sock.recv(1024)
+                    if not data:  # If connection closed, received data will be empty
+                        self.logger.debug("Connection closed by remote")
+                        break
+
+                    # there maybe more than one object in data. one object per line.
+                    # use parse function to parse the json objects
+                    buffer += data.decode()
+                    results, buffer = parse_json_objects(buffer)
+                    for res in results:
+                        if res.get("event", "") == "GUEST_PANICKED":
+                            self.panic += 1
+                            self.logger.debug("qemu panic! panic count: %d", self.panic)
+                            # send enter to qemu when it restore to match pexpect prompt
+                            self.shell.send("\r")
+                            self.logger.debug("Already sended enter to qemu")
+                except socket.timeout:
+                    # On timeout, just continue the loop until total timeout
+                    continue
+                except Exception as e:
+                    self.logger.error(f"Error in socket listen: {str(e)}")
+                    break
+        finally:
+            self.logger.debug(f"Listen ended with panic count: {self.panic}")
 
     def __del__(self):
         """Clean the socket"""
         self.sock.close()
 
 
-# 注入用户态使用的socket类
+# Client to inject faults to user's app
 class SocketClient_app:
     def __init__(
         self,
@@ -226,17 +191,17 @@ class SocketClient_app:
         guest_send_path,
     ):
         """
-        :param sever_address: socket file path
+        :param sever_address: QMP socket file path
         :param logger: logger to use, commonly is LAVA logger, which can print log to Web
+        :param appcommand: command to launch app that need to inject faults
         :param flipshell: The command to inject faults via gdb
         :param log_stdout: gdb log stdout
         :param log_stderr: gdb log stderr
-        :param hots: host for ssh
         :param port: port for ssh
+        :param hots: host for ssh
         :param username: username for ssh
         :param password: password for ssh
         :param prompts: prompts for pexcept
-        :param appcommand: command to launch app that need to inject faults
         :param guest_send_path: guest_send.sh path in rootfs
         """
 
@@ -251,9 +216,9 @@ class SocketClient_app:
         self.prompts = prompts
         self.guest_send_path = guest_send_path
         # TODO: guest_send.sh should store out of guest rootfs
-        self.appcommand = (
-            f"nohup bash {self.guest_send_path} {app_command} > /tmp/guest.log 2>&1 &"
-        )
+        self.appcommand = None
+        if app_command:
+            self.appcommand = f"nohup bash {self.guest_send_path} {app_command} > /tmp/guest.log 2>&1 &"
         # virtio-serial-pci socket
         self.sever_address = sever_address
         socket_family = socket.AF_UNIX
@@ -289,8 +254,16 @@ class SocketClient_app:
 
         self.logger.debug(f"check if port {self.port} is listened")
 
+        # Add timeout mechanism to avoid infinite loop
+        max_wait_time = 60  # Wait for maximum of 60 seconds
+        start_time = time.time()
         while not is_port_listening(self.host, self.port):
-            pass
+            if time.time() - start_time > max_wait_time:
+                self.logger.error(
+                    f"Timeout waiting for port {self.port} to be listened"
+                )
+                return  # Exit function after timeout
+            time.sleep(0.5)  # Add short sleep to reduce CPU usage
 
         self.logger.debug(f"port {self.port} is listened")
 
@@ -310,8 +283,9 @@ class SocketClient_app:
                 ssh.expect(f"{self.username}@{self.host}'s password: ", timeout=600)
                 ssh.sendline(str(self.password))
                 ssh.expect(f"{self.prompts}")
-                ssh.sendline(self.appcommand)
-                ssh.expect(f"{self.prompts}")
+                if self.appcommand:
+                    ssh.sendline(self.appcommand)
+                    ssh.expect(f"{self.prompts}")
                 ssh.sendline("exit")
                 ssh.close()
                 logfile.close()
@@ -710,8 +684,6 @@ class CallQemuAction(Action):
                         "-batch",
                         "-ex",
                         "set pagination off",
-                        "-ex",
-                        "maintenance packet Qqemu.PhyMemMode:1",
                     ]
                 )
 
@@ -768,21 +740,16 @@ class CallQemuAction(Action):
                 self.logger.error("pvpanic_pci and pvpanic config not set")
 
             # TODO: implement a more roburst command checker here.
-            elif (
-                "-qmp" not in cmd_list
-                or "pvpanic-pci" not in cmd_list
-                or "shutdown=pause,panic=none" not in cmd_list
-                or "-s" not in cmd_list
-            ):
-                # qemu boot option is not correct, we need '-device pvpanic-pci',
-                # '-qmp unix:/tmp/qmp.sock,server=off,wait=no', '-action shutdown=pause,panic=none' and '-s'
+            elif not can_support_panic_count(cmd_list):
                 self.logger.error("Qemu boot options do not support panic count.")
             else:
                 try:
                     socket_client = SocketClient(socket_file, self.logger, shell)
-                    threading.Thread(
+                    panic_thread = threading.Thread(
                         target=panic_count, args=(socket_client, self.job.job_id)
-                    ).start()
+                    )
+                    panic_thread.daemon = True  # Set as daemon thread so it will terminate when main program exits
+                    panic_thread.start()
                     self.logger.debug("panic count thread started")
                 except Exception as e:
                     self.logger.error("Count panic got exception: %s", str(e))
@@ -804,9 +771,11 @@ class CallQemuAction(Action):
                             "guest_send_path", "/root/guest_send.sh"
                         ),
                     )
-                    threading.Thread(
+                    app_thread = threading.Thread(
                         target=app_inject, args=(socket_client_app,)
-                    ).start()
+                    )
+                    app_thread.daemon = True  # Set as daemon thread so it will terminate when main program exits
+                    app_thread.start()
                     self.logger.debug("Appinject thread started")
                 except Exception as e:
                     self.logger.error("Appinject got exception: %s", str(e))
@@ -840,9 +809,74 @@ class CallQemuAction(Action):
 
 
 def fault_inject_callback(flipshell, log_stdout, log_stderr, logger):
-    with open(log_stdout, "w") as stdout, open(log_stderr, "w") as stderr:
-        subprocess.Popen(flipshell, stdout=stdout, stderr=stderr)
-    logger.debug("Spawn a thread to inject faults, Command is %s", flipshell)
+    """
+    Use pexpect to start gdb-multiarch and execute commands one by one
+
+    :param flipshell: List of command arguments for gdb-multiarch
+    :param log_stdout: Path to stdout log file
+    :param log_stderr: Path to stderr log file
+    :param logger: Logger instance
+    """
+    try:
+        # Extract gdb binary and commands from flipshell
+        if not flipshell or flipshell[0] != "gdb-multiarch":
+            logger.error("Invalid flipshell command structure")
+            return
+
+        # Parse commands from flipshell list
+        gdb_commands = []
+        i = 1  # Skip "gdb-multiarch"
+        while i < len(flipshell):
+            if flipshell[i] == "-ex" and i + 1 < len(flipshell):
+                gdb_commands.append(flipshell[i + 1])
+                i += 2
+            elif flipshell[i] in ["-q", "-batch"]:
+                # Skip these flags as we handle them differently with pexpect
+                i += 1
+            else:
+                i += 1
+
+        if not gdb_commands:
+            logger.warning("No gdb commands found in flipshell")
+            return
+
+        logger.debug("Starting gdb-multiarch with pexpect, commands: %s", gdb_commands)
+
+        # Start gdb-multiarch with pexpect
+        with open(log_stdout, "wb") as stdout, open(log_stderr, "wb") as stderr:
+            gdb_process = pexpect.spawn("gdb-multiarch", ["-q"])
+            gdb_process.logfile = stdout
+
+            # Wait for the (gdb) prompt
+            gdb_process.expect(r"\(gdb\)\s*")
+            logger.debug("GDB started and ready")
+
+            # Execute each command one by one
+            for cmd in gdb_commands:
+                logger.debug("Executing GDB command: %s", cmd)
+                gdb_process.sendline(cmd)
+
+                # Wait for the (gdb) prompt to ensure command completion
+                try:
+                    gdb_process.expect(r"\(gdb\)\s*", timeout=30)
+                    logger.debug("Command completed: %s", cmd)
+                except pexpect.TIMEOUT:
+                    logger.warning("Timeout waiting for command completion: %s", cmd)
+                    # Continue with next command even if timeout
+                except pexpect.EOF:
+                    logger.info("GDB process ended after command: %s", cmd)
+                    break
+
+            # Ensure gdb exits cleanly if still running
+            if gdb_process.isalive():
+                logger.debug("Closing GDB process")
+
+                gdb_process.close()
+
+    except Exception as e:
+        logger.error("Error in fault injection: %s", str(e))
+
+    logger.debug("Fault injection thread completed, Command was %s", flipshell)
 
 
 def parse_time_string(time_str):
@@ -869,9 +903,52 @@ def parse_time_string(time_str):
         return value * 1e-6
 
 
+def can_support_panic_count(cmd_list: List[str]):
+    """
+    Check if the boot params support the panic count feature
+
+    For example: '-device pvpanic-pci', '-qmp unix:/tmp/qmp.sock,server=off,wait=no',
+    '-action shutdown=pause,panic=none' and '-s' can support the feature
+    """
+    found_pvpanic = (
+        "pvpanic-pci" in cmd_list and "shutdown=pause,panic=none" in cmd_list
+    )
+
+    found_gdb = "-gdb" in cmd_list or "-s" in cmd_list
+
+    found_qmp = False
+    for cmd in cmd_list:
+        if "mode=control" in cmd or "-qmp" in cmd:
+            found_qmp = True
+
+    is_valid = found_qmp and found_gdb and found_pvpanic
+
+    return is_valid
+
+
 def panic_count(socket_client: SocketClient, job_id: int):
+    # Add timeout mechanism to avoid infinite loop
+    max_attempts = 30  # Try up to 30 times, about 60 seconds
+    for attempt in range(max_attempts):
+        if socket_client.connect():
+            break
+        time.sleep(2)
+        if attempt == max_attempts - 1:
+            socket_client.logger.error(
+                "Failed to connect to socket after multiple attempts"
+            )
+            return  # Exit function if connection fails
+
     socket_client.send('{"execute": "qmp_capabilities"}')
-    socket_client.listen()
+
+    # Create a new thread to run listen with timeout
+    listen_thread = threading.Thread(target=socket_client.listen)
+    listen_thread.daemon = True
+    listen_thread.start()
+
+    # Give listen thread at most 5 minutes to run
+    listen_thread.join(300)
+
     # logger has already released here after socket_client disconnected to QEMU
     # store the results to file
     os.makedirs("/tmp" + str(job_id), exist_ok=True)
@@ -882,8 +959,29 @@ def panic_count(socket_client: SocketClient, job_id: int):
 
 
 def app_inject(socket_client: SocketClient_app):
-    socket_client.listen()
-    del socket_client
+    try:
+        # Use event and timeout mechanism
+        completed = threading.Event()
+
+        def listen_with_timeout():
+            try:
+                socket_client.listen()
+            finally:
+                completed.set()  # Mark task as completed
+
+        # Start a thread to execute listen operation
+        listen_thread = threading.Thread(target=listen_with_timeout)
+        listen_thread.daemon = True
+        listen_thread.start()
+
+        # Wait for at most 5 minutes
+        if not completed.wait(300):
+            socket_client.logger.warning("App inject timeout after 300 seconds")
+
+    except Exception as e:
+        socket_client.logger.error(f"Error in app_inject: {str(e)}")
+    finally:
+        del socket_client
 
 
 def parse_json_objects(buffer):
@@ -892,7 +990,7 @@ def parse_json_objects(buffer):
         try:
             obj, idx = json.JSONDecoder().raw_decode(buffer)
             results.append(obj)
-            buffer = buffer[idx:].lstrip()  # remove parsed part   .lstrip()去掉前导空白
+            buffer = buffer[idx:].lstrip()  # remove parsed part
         except json.JSONDecodeError:
             # partial data, receive next time.
             break
