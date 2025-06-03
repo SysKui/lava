@@ -172,6 +172,37 @@ class SocketClient:
         """Clean the socket"""
         self.sock.close()
 
+class SocketServerForSerial:
+    socket_address = "/tmp/qemu-serial.sock"
+    def __init__(self, shell, logger):
+        """
+        :param shell: QEMU pexcept.spawn object
+        :param logger: LAVA logger object
+        """
+        self.shell = shell
+        self.logger = logger
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        # Make sure we remove any existing socket file
+        try:
+            if os.path.exists(SocketServerForSerial.socket_address):
+                os.unlink(SocketServerForSerial.socket_address)
+                self.logger.debug(f"Deleted existing socket file at {SocketServerForSerial.socket_address}")
+        except OSError as e:
+            self.logger.warning(f"Failed to delete socket file: {str(e)}")
+
+    def handle_request(self, data):
+        self.shell.send(data.decode())
+        self.sock.send("ACK".encode())
+
+    def listen(self):
+        self.sock.bind(SocketServerForSerial.socket_address)
+        self.sock.listen()
+        self.logger.debug(f"SocketServerForSerial listening on {SocketServerForSerial.socket_address}")
+        while True:
+            conn, addr = self.sock.accept()
+            self.logger.debug(f"SocketServerForSerial accepted connection from {addr}")
+            data = conn.recv(1024)
+            self.handle_request(data)
 
 # Client to inject faults to user's app
 class SocketClient_app:
@@ -639,6 +670,10 @@ class CallQemuAction(Action):
         shell_connection = self.session_class(self.job, shell)
         shell_connection = super().run(shell_connection, max_end_time)
 
+        self.set_namespace_data(
+            action="shared", label="shared", key="connection", value=shell_connection
+        )
+
         # Inject faults into qemu virtual machine
         # Get the file system path
         rootfs_url = self.job.parameters["actions"][0]["deploy"]["images"]["rootfs"][
@@ -668,137 +703,152 @@ class CallQemuAction(Action):
         app_start_command = fault_inject.get("start_command", "")
 
         flipshell = []
+        if inject_command == []:
+            # No inject_commands, just return the shell connection
+            self.logger.info("No inject commands found, returning shell connection")
+            return shell_connection
+        
+        is_appinject = False
+        # construct flipshell to inject faults
+        if shutil.which("gdb-multiarch") is None:
+            self.logger.debug("Executable gdb-multiarch is not found")
+        else:
+            flipshell.extend(
+                [
+                    "gdb-multiarch",
+                    "-q",
+                    "-batch",
+                    "-ex",
+                    "set pagination off",
+                ]
+            )
 
-        # Are there inject_commands?
-        if inject_command != []:
-            # Yes, parse inject_command
-            is_appinject = False
-            # construct flipshell to inject faults
-            if shutil.which("gdb-multiarch") is None:
-                self.logger.debug("Executable gdb-multiarch is not found")
-            else:
-                flipshell.extend(
-                    [
-                        "gdb-multiarch",
-                        "-q",
-                        "-batch",
-                        "-ex",
-                        "set pagination off",
-                    ]
-                )
-
-                fault_number = 0
-                # Determine whether appinject is used
-                # TODO: Use argparse to parse the param, not parse by the index.
-                for cmd in inject_command:
-                    if cmd.strip().startswith("appinject"):
-                        is_appinject = True
-                    if (
-                        cmd.strip().startswith("snapinject")
-                        or cmd.strip().startswith("autoinject")
-                        or cmd.strip().startswith("appinject")
-                    ):
-                        total_fault_number = int(
-                            re.search(r"--total-fault-number\s+(\d+)", cmd).group(1)
-                        )
-                        self.logger.info(f"fault number add: {total_fault_number}")
-                        fault_number += int(total_fault_number)
-                        self.logger.info(f"Current fault number: {fault_number}")
-                    if cmd.strip().startswith("snapinject") and not rootfs_url.endswith(
-                        "qcow2"
-                    ):
-                        self.logger.error("Image type is not qcow2")
-                    else:
-                        if is_appinject:
-                            # TODO: path to store log should be specify by user
-                            flipshell.extend(["-ex", cmd + " /root/output.log"])
-                        else:
-                            flipshell.extend(["-ex", cmd])
-                try:
-                    os.makedirs("/tmp/" + str(self.job.job_id))
-                except FileExistsError:
-                    self.logger.error(
-                        "Dir /tmp/" + str(self.job.job_id) + "already existed"
+            fault_number = 0
+            # Determine whether appinject is used and sum the fault numbers
+            for cmd in inject_command:
+                if cmd.strip().startswith("appinject"):
+                    is_appinject = True
+                if (
+                    cmd.strip().startswith("snapinject")
+                    or cmd.strip().startswith("autoinject")
+                    or cmd.strip().startswith("appinject")
+                ):
+                    total_fault_number = int(
+                        re.search(r"--total-fault-number\s+(\d+)", cmd).group(1)
                     )
-                with open(
-                    "/tmp/" + str(self.job.job_id) + "/fault_number.txt", "w"
-                ) as f:
-                    f.write(str(fault_number))
-                # Add detach and quit to make sure qemu continue
-                flipshell.extend(["-ex", "detach", "-ex", "quit"])
-
-            # create a client connected to qemu qmp server to read the panic event and count it
-            cmd_list = " ".join(self.sub_command).split(" ")
-            kernel_file = cmd_list[cmd_list.index("-kernel") + 1]
-            if (
-                subprocess.run(["sh", "/root/check-pvpanic", kernel_file]).returncode
-                != 0
-            ):
-                # Kernel should open 'ikconfig', 'pvpanic_pci' and 'pvpanic' config,
-                # because driver 'pvpanic-pci' is necessary to get panic event in qemu,
-                # and 'ikconfig' is necessary to check whether the pvpanic-pci config is chosen
-                self.logger.error("pvpanic_pci and pvpanic config not set")
-
-            # TODO: implement a more roburst command checker here.
-            elif not can_support_panic_count(cmd_list):
-                self.logger.error("Qemu boot options do not support panic count.")
-            else:
-                try:
-                    socket_client = SocketClient(socket_file, self.logger, shell)
-                    panic_thread = threading.Thread(
-                        target=panic_count, args=(socket_client, self.job.job_id)
-                    )
-                    panic_thread.daemon = True  # Set as daemon thread so it will terminate when main program exits
-                    panic_thread.start()
-                    self.logger.debug("panic count thread started")
-                except Exception as e:
-                    self.logger.error("Count panic got exception: %s", str(e))
-
-            if is_appinject:
-                try:
-                    socket_client_app = SocketClient_app(
-                        socket_app_file,
-                        self.logger,
-                        app_start_command,
-                        flipshell,
-                        log_stdout,
-                        log_stderr,
-                        port=fault_inject.get("port", "1234"),
-                        host=fault_inject.get("host", "localhost"),
-                        password=password,
-                        prompts=prompts,
-                        guest_send_path=fault_inject.get(
-                            "guest_send_path", "/root/guest_send.sh"
-                        ),
-                    )
-                    app_thread = threading.Thread(
-                        target=app_inject, args=(socket_client_app,)
-                    )
-                    app_thread.daemon = True  # Set as daemon thread so it will terminate when main program exits
-                    app_thread.start()
-                    self.logger.debug("Appinject thread started")
-                except Exception as e:
-                    self.logger.error("Appinject got exception: %s", str(e))
-            else:
-                # Delayed execution of the inject action
-                if delayed != "":
-                    timer = TimerWithCallback(
-                        parse_time_string(delayed),
-                        fault_inject_callback,
-                        flipshell,
-                        log_stdout,
-                        log_stderr,
-                        self.logger,
-                    )
-                    timer.start()
+                    self.logger.info(f"fault number add: {total_fault_number}")
+                    fault_number += int(total_fault_number)
+                    self.logger.info(f"Current fault number: {fault_number}")
+                if cmd.strip().startswith("snapinject") and not rootfs_url.endswith(
+                    "qcow2"
+                ):
+                    self.logger.error("Image type is not qcow2")
                 else:
-                    fault_inject_callback(
-                        flipshell, log_stdout, log_stderr, self.logger
-                    )
+                    if is_appinject:
+                        # TODO: path to store log should be specify by user
+                        flipshell.extend(["-ex", cmd + " /root/output.log"])
+                    else:
+                        flipshell.extend(["-ex", cmd])
+            try:
+                os.makedirs("/tmp/" + str(self.job.job_id))
+            except FileExistsError:
+                self.logger.error(
+                    "Dir /tmp/" + str(self.job.job_id) + "already existed"
+                )
+            with open(
+                "/tmp/" + str(self.job.job_id) + "/fault_number.txt", "w"
+            ) as f:
+                f.write(str(fault_number))
+            # Add detach and quit to make sure qemu continue
+            flipshell.extend(["-ex", "detach", "-ex", "quit"])
 
-        self.set_namespace_data(
-            action="shared", label="shared", key="connection", value=shell_connection
-        )
+        # Split sub_command to the fine-grained list
+        cmd_list = " ".join(self.sub_command).split(" ")
+        kernel_file = cmd_list[cmd_list.index("-kernel") + 1]
+
+        # Make sure the kernel has the necessary config
+        # /root/check-pvpanic is copied when docker image build, if you change the path here, you must change the
+        # docker image build script
+        if subprocess.run(["sh", "/root/check-pvpanic", kernel_file]).returncode != 0:
+            # Kernel should open 'ikconfig', 'pvpanic_pci' and 'pvpanic' config,
+            # because driver 'pvpanic-pci' is necessary to get panic event in qemu,
+            # and 'ikconfig' is necessary to check whether the pvpanic-pci config is chosen
+            self.logger.error("pvpanic_pci and pvpanic config not set")
+            return shell_connection
+
+        if not can_support_panic_count(cmd_list):
+            self.logger.error("Qemu boot options do not support panic count.")
+            return shell_connection
+        
+        if not socket_file:
+            self.logger.error("No socket file specified for qemu")
+            return shell_connection
+
+        # Create a client connected to qemu qmp server to read the panic event and count it
+        try:
+            socket_client = SocketClient(socket_file, self.logger, shell)
+            panic_thread = threading.Thread(
+                target=panic_count, args=(socket_client, self.job.job_id)
+            )
+            panic_thread.daemon = True  # Set as daemon thread so it will terminate when main program exits
+            panic_thread.start()
+            self.logger.debug("panic count thread started")
+        except Exception as e:
+            self.logger.error("Count panic got exception: %s", str(e))
+
+        # Start a thread to listen the socket server and get the response
+        try:
+            socket_server = SocketServerForSerial(shell, self.logger)
+            socket_thread = threading.Thread(
+                target=socket_server.listen, args=()
+            )
+            socket_thread.daemon = True  # Set as daemon thread so it will terminate when main program exits
+            socket_thread.start()
+            self.logger.debug("SocketServerForSerial thread started")
+        except Exception as e:
+            self.logger.error("SocketServerForSerial got exception: %s", str(e))
+
+        if is_appinject:
+            try:
+                socket_client_app = SocketClient_app(
+                    socket_app_file,
+                    self.logger,
+                    app_start_command,
+                    flipshell,
+                    log_stdout,
+                    log_stderr,
+                    port=fault_inject.get("port", "1234"),
+                    host=fault_inject.get("host", "localhost"),
+                    password=password,
+                    prompts=prompts,
+                    guest_send_path=fault_inject.get(
+                        "guest_send_path", "/root/guest_send.sh"
+                    ),
+                )
+                app_thread = threading.Thread(
+                    target=app_inject, args=(socket_client_app,)
+                )
+                app_thread.daemon = True  # Set as daemon thread so it will terminate when main program exits
+                app_thread.start()
+                self.logger.debug("Appinject thread started")
+            except Exception as e:
+                self.logger.error("Appinject got exception: %s", str(e))
+        else:
+            # Delayed execution of the inject action
+            if delayed != "":
+                timer = TimerWithCallback(
+                    parse_time_string(delayed),
+                    fault_inject_callback,
+                    flipshell,
+                    log_stdout,
+                    log_stderr,
+                    self.logger,
+                )
+                timer.start()
+            else:
+                fault_inject_callback(
+                    flipshell, log_stdout, log_stderr, self.logger
+                )
 
         return shell_connection
 
