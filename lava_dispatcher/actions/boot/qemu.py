@@ -172,8 +172,10 @@ class SocketClient:
         """Clean the socket"""
         self.sock.close()
 
+
 class SocketServerForSerial:
     socket_address = "/tmp/qemu-serial.sock"
+
     def __init__(self, shell, logger):
         """
         :param shell: QEMU pexcept.spawn object
@@ -186,25 +188,31 @@ class SocketServerForSerial:
         try:
             if os.path.exists(SocketServerForSerial.socket_address):
                 os.unlink(SocketServerForSerial.socket_address)
-                self.logger.debug(f"Deleted existing socket file at {SocketServerForSerial.socket_address}")
+                self.logger.debug(
+                    f"Deleted existing socket file at {SocketServerForSerial.socket_address}"
+                )
         except OSError as e:
             self.logger.warning(f"Failed to delete socket file: {str(e)}")
 
     def handle_request(self, data):
         self.shell.send(data.decode())
-        self.sock.send("ACK".encode())
+        self.logger.debug(f"Send to qemu: {data}")
 
     def listen(self):
         self.sock.bind(SocketServerForSerial.socket_address)
         self.sock.listen()
-        self.logger.debug(f"SocketServerForSerial listening on {SocketServerForSerial.socket_address}")
+        self.logger.debug(
+            f"SocketServerForSerial listening on {SocketServerForSerial.socket_address}"
+        )
         while True:
             conn, addr = self.sock.accept()
             self.logger.debug(f"SocketServerForSerial accepted connection from {addr}")
             data = conn.recv(1024)
             self.handle_request(data)
 
+
 # Client to inject faults to user's app
+# TODO: refactor this class
 class SocketClient_app:
     def __init__(
         self,
@@ -229,7 +237,7 @@ class SocketClient_app:
         :param log_stdout: gdb log stdout
         :param log_stderr: gdb log stderr
         :param port: port for ssh
-        :param hots: host for ssh
+        :param host: host for ssh
         :param username: username for ssh
         :param password: password for ssh
         :param prompts: prompts for pexcept
@@ -304,6 +312,7 @@ class SocketClient_app:
         max_retries = 3  # Retry at most 2 time (i.e. 3 attempts in total)
         retry_delay = 5  # Retry interval (seconds)
 
+        # TODO: we can use socket to test if the ssh is usable
         for attempt in range(max_retries + 1):
             try:
                 ssh = pexpect.spawn(
@@ -676,11 +685,13 @@ class CallQemuAction(Action):
 
         # Inject faults into qemu virtual machine
         # Get the file system path
-        rootfs_url = self.job.parameters["actions"][0]["deploy"]["images"]["rootfs"][
-            "url"
-        ]
+        rootfs_url = self.job.parameters["actions"][0]["deploy"]["images"].get(
+            "rootfs"
+        )["url"]
 
-        fault_inject = self.job.parameters["actions"][1]["boot"].get("fault_inject", {})
+        fault_inject_params = self.job.parameters["actions"][1]["boot"].get(
+            "fault_inject_params", {}
+        )
         prompts = self.job.parameters["actions"][1]["boot"].get("prompts", [])[0]
         password = (
             self.job.parameters["actions"][1]["boot"]
@@ -688,26 +699,26 @@ class CallQemuAction(Action):
             .get("password", "519ailab")
         )
         # Returns the injected command, otherwise returns an empty list
-        inject_command = fault_inject.get("commands", [])
+        inject_command = fault_inject_params.get("commands", [])
         # stdout: /tmp/test.out
-        log_stdout = fault_inject.get("stdout", "/dev/null")
+        log_stdout = fault_inject_params.get("stdout", "/dev/null")
         # stderr: /tmp/test.err
-        log_stderr = fault_inject.get("stderr", "/dev/null")
+        log_stderr = fault_inject_params.get("stderr", "/dev/null")
         # Add a delay option
-        delayed = fault_inject.get("delayed", "")
-        # socket: /tmp/qmp.sock
-        socket_file = fault_inject.get("socket", "")
+        delayed = fault_inject_params.get("delayed", "")
+        # qmp_socket: /tmp/qmp.sock
+        socket_file = fault_inject_params.get("qmp_socket", "")
         # /tmp/vm_sync_signal
-        socket_app_file = fault_inject.get("socket_app", "")
+        socket_app_file = fault_inject_params.get("socket_app", "")
         # User startup command
-        app_start_command = fault_inject.get("start_command", "")
+        app_start_command = fault_inject_params.get("start_command", "")
 
         flipshell = []
         if inject_command == []:
             # No inject_commands, just return the shell connection
             self.logger.info("No inject commands found, returning shell connection")
             return shell_connection
-        
+
         is_appinject = False
         # construct flipshell to inject faults
         if shutil.which("gdb-multiarch") is None:
@@ -755,9 +766,7 @@ class CallQemuAction(Action):
                 self.logger.error(
                     "Dir /tmp/" + str(self.job.job_id) + "already existed"
                 )
-            with open(
-                "/tmp/" + str(self.job.job_id) + "/fault_number.txt", "w"
-            ) as f:
+            with open("/tmp/" + str(self.job.job_id) + "/fault_number.txt", "w") as f:
                 f.write(str(fault_number))
             # Add detach and quit to make sure qemu continue
             flipshell.extend(["-ex", "detach", "-ex", "quit"])
@@ -779,7 +788,7 @@ class CallQemuAction(Action):
         if not can_support_panic_count(cmd_list):
             self.logger.error("Qemu boot options do not support panic count.")
             return shell_connection
-        
+
         if not socket_file:
             self.logger.error("No socket file specified for qemu")
             return shell_connection
@@ -799,9 +808,7 @@ class CallQemuAction(Action):
         # Start a thread to listen the socket server and get the response
         try:
             socket_server = SocketServerForSerial(shell, self.logger)
-            socket_thread = threading.Thread(
-                target=socket_server.listen, args=()
-            )
+            socket_thread = threading.Thread(target=socket_server.listen, args=())
             socket_thread.daemon = True  # Set as daemon thread so it will terminate when main program exits
             socket_thread.start()
             self.logger.debug("SocketServerForSerial thread started")
@@ -817,11 +824,11 @@ class CallQemuAction(Action):
                     flipshell,
                     log_stdout,
                     log_stderr,
-                    port=fault_inject.get("port", "1234"),
-                    host=fault_inject.get("host", "localhost"),
+                    port=fault_inject_params.get("port", "1234"),
+                    host=fault_inject_params.get("host", "localhost"),
                     password=password,
                     prompts=prompts,
-                    guest_send_path=fault_inject.get(
+                    guest_send_path=fault_inject_params.get(
                         "guest_send_path", "/root/guest_send.sh"
                     ),
                 )
@@ -846,9 +853,18 @@ class CallQemuAction(Action):
                 )
                 timer.start()
             else:
-                fault_inject_callback(
-                    flipshell, log_stdout, log_stderr, self.logger
+                inject_thread = threading.Thread(
+                    target=fault_inject_callback,
+                    args=[
+                        flipshell,
+                        log_stdout,
+                        log_stderr,
+                        self.logger,
+                        fault_inject_params,
+                    ],
+                    daemon=True,
                 )
+                inject_thread.start()
 
         return shell_connection
 
@@ -858,7 +874,32 @@ class CallQemuAction(Action):
             self.docker.destroy()
 
 
-def fault_inject_callback(flipshell, log_stdout, log_stderr, logger):
+def wait_for_ssh(host, port=22, timeout=300):
+    start_time = time.time()
+
+    while time.time() - start_time < timeout:
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(2)
+            sock.connect((host, port))
+
+            # Read SSH banner
+            banner = sock.recv(1024).decode("utf-8", errors="ignore")
+            sock.close()
+
+            if banner.startswith("SSH-"):
+                print(f"SSH service ready on {host}:{port}")
+                return True
+
+        except Exception:
+            pass
+
+        time.sleep(2)
+
+    return False
+
+
+def fault_inject_callback(flipshell, log_stdout, log_stderr, logger, params):
     """
     Use pexpect to start gdb-multiarch and execute commands one by one
 
@@ -890,6 +931,18 @@ def fault_inject_callback(flipshell, log_stdout, log_stderr, logger):
             logger.warning("No gdb commands found in flipshell")
             return
 
+        if params.get("inject_after_boot", False):
+            ssh_host = params.get("ssh_host", 22)
+            ssh_port = params.get("ssh_port", "localhost")
+            logger.debug(
+                f"Wait for boot completion by checking ssh: host {ssh_host}, port {ssh_port}"
+            )
+            if not wait_for_ssh(ssh_host, ssh_port):
+                logger.error("Wait for boot completion timeout")
+                return
+        # Reserve some time for the login operation of Lava.
+        logger.debug("Sleep 5 seconds")
+        time.sleep(5)
         logger.debug("Starting gdb-multiarch with pexpect, commands: %s", gdb_commands)
 
         # Start gdb-multiarch with pexpect
@@ -1001,7 +1054,7 @@ def panic_count(socket_client: SocketClient, job_id: int):
 
     # logger has already released here after socket_client disconnected to QEMU
     # store the results to file
-    os.makedirs("/tmp" + str(job_id), exist_ok=True)
+    os.makedirs("/tmp/" + str(job_id), exist_ok=True)
     with open("/tmp/" + str(job_id) + "/panic_count.txt", "w") as f:
         f.write(str(socket_client.panic))
         f.flush()
@@ -1013,14 +1066,19 @@ def app_inject(socket_client: SocketClient_app):
         # Use event and timeout mechanism
         completed = threading.Event()
 
-        def listen_with_timeout():
+        def listen_with_timeout(socket_client):
             try:
                 socket_client.listen()
             finally:
                 completed.set()  # Mark task as completed
 
         # Start a thread to execute listen operation
-        listen_thread = threading.Thread(target=listen_with_timeout)
+        listen_thread = threading.Thread(
+            target=listen_with_timeout,
+            args=[
+                socket_client,
+            ],
+        )
         listen_thread.daemon = True
         listen_thread.start()
 

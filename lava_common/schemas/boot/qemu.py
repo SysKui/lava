@@ -20,12 +20,15 @@ def qemu_fault_inject():
         Required("stdout"): str,
         Required("stderr"): str,
         Optional("delayed"): str,
-        Optional("socket"): str,
+        Optional("qmp_socket"): str,
         Optional("socket_app"):str,
         Optional("start_command"):str,
         Optional("port"): str,
         Optional("host"): str,
-        Optional("guest_send_path"): str
+        Optional("guest_send_path"): str,
+        Optional("inject_after_boot"): bool,
+        Optional("ssh_port"): int,
+        Optional("ssh_host"): str,
     }
 
 
@@ -40,6 +43,6 @@ def schema():
             "auto_login"
         ): boot.auto_login(),  # TODO: if auto_login => prompt is required
         Optional("docker"): qemu_docker(),
-        Optional("fault_inject"): qemu_fault_inject(),
+        Optional("fault_inject_params"): qemu_fault_inject(),
     }
     return {**boot.schema(), **base}
