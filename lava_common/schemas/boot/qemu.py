@@ -5,7 +5,7 @@
 #
 # SPDX-License-Identifier: GPL-2.0-or-later
 
-from voluptuous import All, Msg, Optional, Required
+from voluptuous import Msg, Optional, Required
 
 from lava_common.schemas import boot, docker
 
@@ -21,14 +21,15 @@ def qemu_fault_inject():
         Required("stderr"): str,
         Optional("delayed"): str,
         Optional("qmp_socket"): str,
-        Optional("socket_app"):str,
-        Optional("start_command"):str,
+        Optional("socket_app"): str,
+        Optional("start_command"): str,
         Optional("port"): str,
         Optional("host"): str,
         Optional("guest_send_path"): str,
         Optional("inject_after_boot"): bool,
         Optional("ssh_port"): int,
         Optional("ssh_host"): str,
+        Optional("serial_socket"): str,
     }
 
 

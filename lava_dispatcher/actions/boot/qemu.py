@@ -174,22 +174,21 @@ class SocketClient:
 
 
 class SocketServerForSerial:
-    socket_address = "/tmp/qemu-serial.sock"
-
-    def __init__(self, shell, logger):
+    def __init__(self, shell, logger, socket_address):
         """
         :param shell: QEMU pexcept.spawn object
         :param logger: LAVA logger object
         """
         self.shell = shell
         self.logger = logger
+        self.socket_address = socket_address
         self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         # Make sure we remove any existing socket file
         try:
-            if os.path.exists(SocketServerForSerial.socket_address):
-                os.unlink(SocketServerForSerial.socket_address)
+            if os.path.exists(self.socket_address):
+                os.unlink(self.socket_address)
                 self.logger.debug(
-                    f"Deleted existing socket file at {SocketServerForSerial.socket_address}"
+                    f"Deleted existing socket file at {self.socket_address}"
                 )
         except OSError as e:
             self.logger.warning(f"Failed to delete socket file: {str(e)}")
@@ -199,10 +198,10 @@ class SocketServerForSerial:
         self.logger.debug(f"Send to qemu: {data}")
 
     def listen(self):
-        self.sock.bind(SocketServerForSerial.socket_address)
+        self.sock.bind(self.socket_address)
         self.sock.listen()
         self.logger.debug(
-            f"SocketServerForSerial listening on {SocketServerForSerial.socket_address}"
+            f"SocketServerForSerial listening on {self.socket_address}"
         )
         while True:
             conn, addr = self.sock.accept()
@@ -807,7 +806,7 @@ class CallQemuAction(Action):
 
         # Start a thread to listen the socket server and get the response
         try:
-            socket_server = SocketServerForSerial(shell, self.logger)
+            socket_server = SocketServerForSerial(shell, self.logger, fault_inject_params.get("serial_socket"))
             socket_thread = threading.Thread(target=socket_server.listen, args=())
             socket_thread.daemon = True  # Set as daemon thread so it will terminate when main program exits
             socket_thread.start()
