@@ -269,10 +269,13 @@ class SocketClient_app:
 
     def run_flipshell(self):
         with open(self.log_stdout, "w") as stdout, open(self.log_stderr, "w") as stderr:
-            subprocess.Popen(self.flipshell, stdout=stdout, stderr=stderr)
-        self.logger.debug(
-            "Spawn a thread to inject faults, Command is %s", self.flipshell
-        )
+            process = subprocess.Popen(self.flipshell, stdout=stdout, stderr=stderr)
+            self.logger.debug(
+                "Spawn a thread to inject faul ts, Command is %s", self.flipshell
+            )
+            process.wait()
+            self.logger.debug("Fault injection completed.") 
+
 
     def listen(self):
         """Listen the socket server and get the response"""
@@ -282,7 +285,7 @@ class SocketClient_app:
             sock.settimeout(1)
 
             try:
-                sock.connect((host, port))
+                sock.connect((host, int(port)))
             except (socket.timeout, socket.error):
                 return False
 
@@ -306,7 +309,7 @@ class SocketClient_app:
         # detech the qemu
         self.logger.debug("check if the qemu is already booted")
 
-        max_retries = 3  # Retry at most 2 time (i.e. 3 attempts in total)
+        max_retries = 10  # Retry at most 2 time (i.e. 3 attempts in total)
         retry_delay = 5  # Retry interval (seconds)
 
         # TODO: we can use socket to test if the ssh is usable
@@ -317,8 +320,10 @@ class SocketClient_app:
                 )
                 logfile = open("/tmp/sshlogfile.txt", "wb")
                 ssh.logfile = logfile
-                ssh.expect(f"{self.username}@{self.host}'s password: ", timeout=600)
-                ssh.sendline(str(self.password))
+                self.logger.debug(f"now the password is {self.password}")
+                ssh.expect(f"{self.username}@{self.host}'s password:", timeout=600)
+                self.logger.debug(f"I will pass my password: {self.password}")
+                ssh.sendline(self.password)
                 ssh.expect(f"{self.prompts}")
                 if self.appcommand:
                     ssh.sendline(self.appcommand)
@@ -353,7 +358,7 @@ class SocketClient_app:
             scp = pexpect.spawn(
                 f"scp -P {self.port} -o StrictHostKeyChecking=no {self.username}@{self.host}:/root/output.log /root/"
             )
-            ssh.expect(f"{self.username}@{self.host}'s password: ", timeout=600)
+            scp.expect(f"{self.username}@{self.host}'s password: ", timeout=600)
             scp.sendline(str(self.password))
             scp.expect(pexpect.EOF)
             scp.close()
@@ -763,7 +768,7 @@ class CallQemuAction(Action):
                 else:
                     if is_appinject:
                         # TODO: path to store log should be specify by user
-                        flipshell.extend(["-ex", cmd + " /root/output.log"])
+                        flipshell.extend(["-ex", cmd + " --range-file /root/output.log"])
                     else:
                         flipshell.extend(["-ex", cmd])
             try:
@@ -800,31 +805,19 @@ class CallQemuAction(Action):
             return shell_connection
 
         # Create a client connected to qemu qmp server to read the panic event and count it
-        try:
-            socket_client = SocketClient(socket_file, self.logger, shell)
-            panic_thread = threading.Thread(
-                target=panic_count, args=(socket_client, self.job.job_id)
-            )
-            panic_thread.daemon = True  # Set as daemon thread so it will terminate when main program exits
-            panic_thread.start()
-            self.logger.debug("panic count thread started")
-        except Exception as e:
-            self.logger.error("Count panic got exception: %s", str(e))
-
-        # Start a thread to listen the socket server and get the response
-        try:
-            socket_server = SocketServerForSerial(
-                shell, self.logger, fault_inject_params.get("serial_socket")
-            )
-            socket_thread = threading.Thread(target=socket_server.listen, args=())
-            socket_thread.daemon = True  # Set as daemon thread so it will terminate when main program exits
-            socket_thread.start()
-            self.logger.debug("SocketServerForSerial thread started")
-        except Exception as e:
-            self.logger.error("SocketServerForSerial got exception: %s", str(e))
 
         if is_appinject:
             try:
+                username = (
+                self.job.parameters["actions"][1]["boot"]
+                .get("auto_login", {})
+                .get("username", "root")
+                )
+                password = (
+                self.job.parameters["actions"][1]["boot"]
+                .get("auto_login", {})
+                .get("password", "519ailab")
+                )
                 socket_client_app = SocketClient_app(
                     socket_app_file,
                     self.logger,
@@ -832,6 +825,7 @@ class CallQemuAction(Action):
                     flipshell,
                     log_stdout,
                     log_stderr,
+                    username=username,
                     port=fault_inject_params.get("port", "1234"),
                     host=fault_inject_params.get("host", "localhost"),
                     password=password,
@@ -1157,6 +1151,8 @@ def app_inject(socket_client: SocketClient_app):
         def listen_with_timeout(socket_client):
             try:
                 socket_client.listen()
+            except Exception as e:
+                socket_client.logger.error(f"Exception in listen thread: {e}")
             finally:
                 completed.set()  # Mark task as completed
 
