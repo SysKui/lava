@@ -805,6 +805,28 @@ class CallQemuAction(Action):
             return shell_connection
 
         # Create a client connected to qemu qmp server to read the panic event and count it
+        try:
+            socket_client = SocketClient(socket_file, self.logger, shell)
+            panic_thread = threading.Thread(
+                target=panic_count, args=(socket_client, self.job.job_id)
+            )
+            panic_thread.daemon = True  # Set as daemon thread so it will terminate when main program exits
+            panic_thread.start()
+            self.logger.debug("panic count thread started")
+        except Exception as e:
+            self.logger.error("Count panic got exception: %s", str(e))
+
+        # Start a thread to listen the socket server and get the response
+        try:
+            socket_server = SocketServerForSerial(
+                shell, self.logger, fault_inject_params.get("serial_socket")
+            )
+            socket_thread = threading.Thread(target=socket_server.listen, args=())
+            socket_thread.daemon = True  # Set as daemon thread so it will terminate when main program exits
+            socket_thread.start()
+            self.logger.debug("SocketServerForSerial thread started")
+        except Exception as e:
+            self.logger.error("SocketServerForSerial got exception: %s", str(e))
 
         if is_appinject:
             try:
