@@ -63,149 +63,341 @@ class BootQemuRetry(RetryAction):
         self.pipeline.add_action(CallQemuAction(self.job))
 
 
-class TimerWithCallback:
+class DelayedTaskExecutor:
+    """Executor for delayed task execution using threading.Timer"""
+
     def __init__(self, interval, callback, *args, **kwargs):
         """
-        :param interval: timer interval
-        :param callback: callback function
-        :param args: function args
-        :param kwargs: function args
+        Initialize delayed task executor.
+
+        :param interval: Delay interval in seconds
+        :param callback: Callback function to execute
+        :param args: Positional arguments for callback
+        :param kwargs: Keyword arguments for callback
         """
-        self.interval = interval
-        self.callback = callback
-        self.args = args
-        self.kwargs = kwargs
-        self.timer = None
+        self._interval = interval
+        self._callback = callback
+        self._args = args
+        self._kwargs = kwargs
+        self._timer = None
 
     def start(self):
-        """Start the timer"""
-        self.timer = threading.Timer(self.interval, self._run)
-        self.timer.daemon = True
-        self.timer.start()
+        """Start the delayed task timer"""
+        self._timer = threading.Timer(self._interval, self._execute)
+        self._timer.daemon = True
+        self._timer.start()
 
-    def _run(self):
-        """run the callback function"""
-        self.callback(*self.args, **self.kwargs)
+    def _execute(self):
+        """Execute the callback function"""
+        self._callback(*self._args, **self._kwargs)
 
     def cancel(self):
-        """cancel the timer"""
-        if self.timer is not None:
-            self.timer.cancel()
+        """Cancel the delayed task if not yet executed"""
+        if self._timer is not None:
+            self._timer.cancel()
+
+    def __enter__(self):
+        """Support context manager protocol"""
+        self.start()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """Ensure timer is cancelled when exiting context"""
+        self.cancel()
+        return False
 
 
-class SocketClient:
-    def __init__(self, server_address, logger, shell):
+# Maintain backward compatibility
+TimerWithCallback = DelayedTaskExecutor
+
+
+class BaseUnixSocketClient:
+    """Base class for Unix Domain Socket clients with common connection logic"""
+
+    def __init__(self, server_address, logger):
         """
-        :param server_address: socket file path
-        :param logger: lava logger
-        :param shell: pexcept.spawn shell
+        Initialize socket client.
+
+        :param server_address: Unix socket file path
+        :param logger: Logger instance
         """
-        # store qemu panic count
-        self.panic = 0
-
-        # store pexcept.spawn class to interact with qemu
-        self.shell = shell
-
-        # set lava logger
-        self.logger = logger
-
-        # unix domain sockets
-        self.server_address = server_address
-        socket_family = socket.AF_UNIX
-        socket_type = socket.SOCK_STREAM
-
-        self.sock = socket.socket(socket_family, socket_type)
+        self._server_address = server_address
+        self._logger = logger
+        self._sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
 
     def connect(self):
+        """Establish connection to socket server"""
         try:
-            self.logger.info(f"SocketClient init: Try connect to {self.server_address}")
-            self.sock.connect(self.server_address)
-            self.logger.info(f"SocketClient connect to {self.server_address}")
+            self._logger.info(f"Attempting to connect to {self._server_address}")
+            self._sock.connect(self._server_address)
+            self._logger.info(f"Successfully connected to {self._server_address}")
+            return True
         except Exception as e:
-            self.logger.error(f"SocketClient init error: {e}")
+            self._logger.error(f"Connection failed: {e}")
             return False
-        return True
 
     def send(self, data: str):
-        """Send str to socket server"""
-        self.sock.sendall(data.encode())
+        """Send string data to socket server"""
+        self._sock.sendall(data.encode())
+
+    def receive(self, buffer_size=1024):
+        """Receive data from socket server"""
+        return self._sock.recv(buffer_size)
+
+    def close(self):
+        """Close the socket connection"""
+        try:
+            self._sock.close()
+        except Exception as e:
+            self._logger.warning(f"Error closing socket: {e}")
+
+    def __del__(self):
+        """Cleanup socket on deletion"""
+        self.close()
+
+
+class QMPEventHandler:
+    """Handler for QEMU Machine Protocol (QMP) events"""
+
+    def __init__(self, logger, shell):
+        """
+        Initialize QMP event handler.
+
+        :param logger: Logger instance
+        :param shell: pexpect.spawn shell for QEMU interaction
+        """
+        self._logger = logger
+        self._shell = shell
+        self._panic_count = 0
+
+    def handle_event(self, event):
+        """
+        Process QMP event.
+
+        :param event: Parsed JSON event dictionary
+        """
+        if event.get("event", "") == "GUEST_PANICKED":
+            self._panic_count += 1
+            self._logger.debug("QEMU panic detected! Count: %d", self._panic_count)
+            # Send enter to QEMU when it restores to match pexpect prompt
+            self._shell.send("\r")
+            self._logger.debug("Sent enter to QEMU shell")
+
+    @property
+    def panic_count(self):
+        """Get the current panic count"""
+        return self._panic_count
+
+
+class QMPMonitor(BaseUnixSocketClient):
+    """Monitor for QEMU QMP events, specifically tracking panic events"""
+
+    def __init__(self, server_address, logger, shell):
+        """
+        Initialize QMP monitor.
+
+        :param server_address: QMP socket file path
+        :param logger: Logger instance
+        :param shell: pexpect.spawn shell for QEMU interaction
+        """
+        super().__init__(server_address, logger)
+        self._event_handler = QMPEventHandler(logger, shell)
+        self._max_listen_time = 300  # 5 minutes
+        self._recv_timeout = 5
 
     def listen(self):
-        """Listen the socket server and get the response"""
-
+        """Listen for QMP events and process them"""
         buffer = ""
-        # Set socket timeout to avoid infinite blocking on recv
-        self.sock.settimeout(5)
-        # Set a total timeout period, listen for maximum 5 minutes
-        max_listen_time = 300  # 5 minutes
+        self._sock.settimeout(self._recv_timeout)
         start_time = time.time()
 
         try:
-            while time.time() - start_time < max_listen_time:
+            while time.time() - start_time < self._max_listen_time:
                 try:
-                    data = self.sock.recv(1024)
-                    if not data:  # If connection closed, received data will be empty
-                        self.logger.debug("Connection closed by remote")
+                    data = self._sock.recv(1024)
+                    if not data:
+                        self._logger.debug("Connection closed by remote")
                         break
 
-                    # there maybe more than one object in data. one object per line.
-                    # use parse function to parse the json objects
                     buffer += data.decode()
-                    results, buffer = parse_json_objects(buffer)
-                    for res in results:
-                        if res.get("event", "") == "GUEST_PANICKED":
-                            self.panic += 1
-                            self.logger.debug("qemu panic! panic count: %d", self.panic)
-                            # send enter to qemu when it restore to match pexpect prompt
-                            self.shell.send("\r")
-                            self.logger.debug("Already sended enter to qemu")
+                    events, buffer = self._parse_json_buffer(buffer)
+
+                    for event in events:
+                        self._event_handler.handle_event(event)
+
                 except socket.timeout:
-                    # On timeout, just continue the loop until total timeout
                     continue
                 except Exception as e:
-                    self.logger.error(f"Error in socket listen: {str(e)}")
+                    self._logger.error(f"Error in socket listen: {str(e)}")
                     break
         finally:
-            self.logger.debug(f"Listen ended with panic count: {self.panic}")
+            self._logger.debug(f"Listen ended with panic count: {self.panic_count}")
 
-    def __del__(self):
-        """Clean the socket"""
-        self.sock.close()
+    @property
+    def panic_count(self):
+        """Get the total panic count"""
+        return self._event_handler.panic_count
+
+    @staticmethod
+    def _parse_json_buffer(buffer):
+        """
+        Parse multiple JSON objects from buffer.
+
+        :param buffer: String buffer containing JSON data
+        :return: Tuple of (list of parsed objects, remaining buffer)
+        """
+        results = []
+        while buffer:
+            try:
+                obj, idx = json.JSONDecoder().raw_decode(buffer)
+                results.append(obj)
+                buffer = buffer[idx:].lstrip()
+            except json.JSONDecodeError:
+                break
+        return results, buffer
 
 
-class SocketServerForSerial:
+# Maintain backward compatibility
+class SocketClient(QMPMonitor):
+    """Backward compatible alias for QMPMonitor"""
+
+    def __init__(self, server_address, logger, shell):
+        super().__init__(server_address, logger, shell)
+        # Keep original attribute names for compatibility
+        self.panic = 0
+        self.shell = shell
+        self.logger = logger
+        self.server_address = server_address
+        self.sock = self._sock
+
+    @property
+    def panic(self):
+        return self._event_handler.panic_count
+
+    @panic.setter
+    def panic(self, value):
+        self._event_handler._panic_count = value
+
+
+class BaseUnixSocketServer:
+    """Base class for Unix Domain Socket servers"""
+
+    def __init__(self, socket_address, logger):
+        """
+        Initialize socket server.
+
+        :param socket_address: Unix socket file path
+        :param logger: Logger instance
+        """
+        self._socket_address = socket_address
+        self._logger = logger
+        self._sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self._cleanup_socket_file()
+
+    def _cleanup_socket_file(self):
+        """Remove existing socket file if present"""
+        try:
+            if os.path.exists(self._socket_address):
+                os.unlink(self._socket_address)
+                self._logger.debug(
+                    f"Removed existing socket file: {self._socket_address}"
+                )
+        except OSError as e:
+            self._logger.warning(f"Failed to remove socket file: {e}")
+
+    def bind_and_listen(self):
+        """Bind socket and start listening"""
+        self._sock.bind(self._socket_address)
+        self._sock.listen()
+        self._logger.debug(f"Server listening on {self._socket_address}")
+
+    def accept_connection(self):
+        """Accept incoming connection"""
+        conn, addr = self._sock.accept()
+        self._logger.debug(f"Accepted connection from {addr}")
+        return conn, addr
+
+    def close(self):
+        """Close the server socket"""
+        try:
+            self._sock.close()
+            self._cleanup_socket_file()
+        except Exception as e:
+            self._logger.warning(f"Error closing server socket: {e}")
+
+
+class SerialCommandForwarder:
+    """Forwards commands from socket to QEMU serial shell"""
+
+    def __init__(self, shell, logger):
+        """
+        Initialize command forwarder.
+
+        :param shell: QEMU pexpect.spawn object
+        :param logger: Logger instance
+        """
+        self._shell = shell
+        self._logger = logger
+
+    def forward(self, data):
+        """
+        Forward data to QEMU shell.
+
+        :param data: Raw bytes data to forward
+        """
+        decoded_data = data.decode()
+        self._shell.send(decoded_data)
+        self._logger.debug(f"Forwarded to QEMU: {decoded_data}")
+
+
+class SerialSocketServer(BaseUnixSocketServer):
+    """Unix socket server that forwards commands to QEMU serial interface"""
+
     def __init__(self, shell, logger, socket_address):
         """
-        :param shell: QEMU pexcept.spawn object
-        :param logger: LAVA logger object
+        Initialize serial socket server.
+
+        :param shell: QEMU pexpect.spawn object
+        :param logger: Logger instance
+        :param socket_address: Unix socket file path
         """
+        super().__init__(socket_address, logger)
+        self._forwarder = SerialCommandForwarder(shell, logger)
+
+    def handle_request(self, data):
+        """
+        Handle incoming request data.
+
+        :param data: Raw bytes data from client
+        """
+        self._forwarder.forward(data)
+
+    def listen(self):
+        """Listen for incoming connections and handle requests"""
+        self.bind_and_listen()
+        while True:
+            conn, addr = self.accept_connection()
+            try:
+                data = conn.recv(1024)
+                if data:
+                    self.handle_request(data)
+            except Exception as e:
+                self._logger.error(f"Error handling request: {e}")
+            finally:
+                conn.close()
+
+
+# Maintain backward compatibility
+class SocketServerForSerial(SerialSocketServer):
+    """Backward compatible alias for SerialSocketServer"""
+
+    def __init__(self, shell, logger, socket_address):
+        super().__init__(shell, logger, socket_address)
+        # Keep original attribute names for compatibility
         self.shell = shell
         self.logger = logger
         self.socket_address = socket_address
-        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        # Make sure we remove any existing socket file
-        try:
-            if os.path.exists(self.socket_address):
-                os.unlink(self.socket_address)
-                self.logger.debug(
-                    f"Deleted existing socket file at {self.socket_address}"
-                )
-        except OSError as e:
-            self.logger.warning(f"Failed to delete socket file: {str(e)}")
-
-    def handle_request(self, data):
-        self.shell.send(data.decode())
-        self.logger.debug(f"Send to qemu: {data}")
-
-    def listen(self):
-        self.sock.bind(self.socket_address)
-        self.sock.listen()
-        self.logger.debug(f"SocketServerForSerial listening on {self.socket_address}")
-        while True:
-            conn, addr = self.sock.accept()
-            self.logger.debug(f"SocketServerForSerial accepted connection from {addr}")
-            data = conn.recv(1024)
-            self.handle_request(data)
+        self.sock = self._sock
 
 
 # Client to inject faults to user's app
@@ -274,8 +466,7 @@ class SocketClient_app:
                 "Spawn a thread to inject faul ts, Command is %s", self.flipshell
             )
             process.wait()
-            self.logger.debug("Fault injection completed.") 
-
+            self.logger.debug("Fault injection completed.")
 
     def listen(self):
         """Listen the socket server and get the response"""
@@ -768,7 +959,9 @@ class CallQemuAction(Action):
                 else:
                     if is_appinject:
                         # TODO: path to store log should be specify by user
-                        flipshell.extend(["-ex", cmd + " --range-file /root/output.log"])
+                        flipshell.extend(
+                            ["-ex", cmd + " --range-file /root/output.log"]
+                        )
                     else:
                         flipshell.extend(["-ex", cmd])
             try:
@@ -831,14 +1024,14 @@ class CallQemuAction(Action):
         if is_appinject:
             try:
                 username = (
-                self.job.parameters["actions"][1]["boot"]
-                .get("auto_login", {})
-                .get("username", "root")
+                    self.job.parameters["actions"][1]["boot"]
+                    .get("auto_login", {})
+                    .get("username", "root")
                 )
                 password = (
-                self.job.parameters["actions"][1]["boot"]
-                .get("auto_login", {})
-                .get("password", "519ailab")
+                    self.job.parameters["actions"][1]["boot"]
+                    .get("auto_login", {})
+                    .get("password", "519ailab")
                 )
                 socket_client_app = SocketClient_app(
                     socket_app_file,
@@ -903,187 +1096,406 @@ class CallQemuAction(Action):
             self.docker.destroy()
 
 
-def wait_for_ssh(host, port=22, timeout=300):
-    start_time = time.time()
+class ServiceReadinessChecker:
+    """Generic service readiness checker with support for various protocols"""
 
-    while time.time() - start_time < timeout:
+    def __init__(self, host, port, timeout=300, check_interval=2):
+        """
+        Initialize service readiness checker.
+
+        :param host: Service host address
+        :param port: Service port number
+        :param timeout: Maximum time to wait for service (seconds)
+        :param check_interval: Time between checks (seconds)
+        """
+        self._host = host
+        self._port = port
+        self._timeout = timeout
+        self._check_interval = check_interval
+
+    def wait_for_service(self):
+        """
+        Wait for service to become ready.
+
+        :return: True if service is ready, False if timeout
+        """
+        start_time = time.time()
+
+        while time.time() - start_time < self._timeout:
+            if self._check_service():
+                return True
+            time.sleep(self._check_interval)
+
+        return False
+
+    def _check_service(self):
+        """
+        Check if service is ready.
+
+        :return: True if service is ready, False otherwise
+        """
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.settimeout(2)
-            sock.connect((host, port))
+            sock.connect((self._host, self._port))
+            sock.close()
+            return True
+        except Exception:
+            return False
+
+
+class SSHServiceChecker(ServiceReadinessChecker):
+    """Specialized checker for SSH service readiness"""
+
+    def _check_service(self):
+        """
+        Check if SSH service is ready by verifying SSH banner.
+
+        :return: True if SSH service is ready, False otherwise
+        """
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(2)
+            sock.connect((self._host, self._port))
 
             # Read SSH banner
             banner = sock.recv(1024).decode("utf-8", errors="ignore")
             sock.close()
 
             if banner.startswith("SSH-"):
-                print(f"SSH service ready on {host}:{port}")
+                print(f"SSH service ready on {self._host}:{self._port}")
                 return True
 
+            return False
         except Exception:
-            pass
+            return False
 
-        time.sleep(2)
 
-    return False
+def wait_for_ssh(host, port=22, timeout=300):
+    """
+    Wait for SSH service to become ready.
+
+    :param host: SSH host address
+    :param port: SSH port number
+    :param timeout: Maximum wait time in seconds
+    :return: True if SSH is ready, False if timeout
+    """
+    checker = SSHServiceChecker(host, port, timeout)
+    return checker.wait_for_service()
+
+
+class GDBCommandParser:
+    """Parser for GDB flipshell commands"""
+
+    @staticmethod
+    def parse(flipshell):
+        """
+        Parse flipshell command list to extract GDB commands.
+
+        :param flipshell: List of command arguments
+        :return: List of GDB commands or None if invalid
+        """
+        if not flipshell or flipshell[0] != "gdb-multiarch":
+            return None
+
+        commands = []
+        i = 1  # Skip "gdb-multiarch"
+        while i < len(flipshell):
+            if flipshell[i] == "-ex" and i + 1 < len(flipshell):
+                commands.append(flipshell[i + 1])
+                i += 2
+            elif flipshell[i] in ["-q", "-batch"]:
+                i += 1
+            else:
+                i += 1
+
+        return commands if commands else None
+
+
+class ProcessManager:
+    """Manages pexpect processes with proper resource cleanup"""
+
+    def __init__(self, logger):
+        """
+        Initialize process manager.
+
+        :param logger: Logger instance
+        """
+        self._logger = logger
+        self._processes = []
+
+    def spawn(self, command, args=None, logfile=None):
+        """
+        Spawn a new pexpect process.
+
+        :param command: Command to execute
+        :param args: Command arguments
+        :param logfile: File object for logging
+        :return: pexpect process
+        """
+        if args is None:
+            process = pexpect.spawn(command)
+        else:
+            process = pexpect.spawn(command, args)
+
+        if logfile:
+            process.logfile = logfile
+
+        self._processes.append(process)
+        return process
+
+    def cleanup(self):
+        """Close all managed processes"""
+        for process in self._processes:
+            if process.isalive():
+                try:
+                    process.close()
+                except Exception as e:
+                    self._logger.warning(f"Error closing process: {e}")
+
+    def __enter__(self):
+        """Support context manager protocol"""
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """Ensure all processes are cleaned up"""
+        self.cleanup()
+        return False
+
+
+class GDBController:
+    """Controller for GDB debugging session"""
+
+    def __init__(self, process, logger):
+        """
+        Initialize GDB controller.
+
+        :param process: pexpect GDB process
+        :param logger: Logger instance
+        """
+        self._process = process
+        self._logger = logger
+        self._prompt_pattern = r"\(gdb\)\s*"
+
+    def wait_ready(self):
+        """Wait for GDB to be ready"""
+        self._process.expect(self._prompt_pattern)
+        self._logger.debug("GDB started and ready")
+
+    def execute_command(self, command, timeout=30):
+        """
+        Execute a GDB command.
+
+        :param command: GDB command string
+        :param timeout: Command timeout in seconds
+        :return: True if successful, False otherwise
+        """
+        self._logger.debug("Executing GDB command: %s", command)
+        self._process.sendline(command)
+
+        try:
+            self._process.expect(self._prompt_pattern, timeout=timeout)
+            self._logger.debug("GDB command completed: %s", command)
+            return True
+        except pexpect.TIMEOUT:
+            self._logger.warning("Timeout waiting for GDB command: %s", command)
+            return False
+        except pexpect.EOF:
+            self._logger.info("GDB process ended after command: %s", command)
+            return False
+
+    def interrupt(self):
+        """Send interrupt signal (Ctrl+C) to GDB"""
+        self._process.sendcontrol("c")
+        self._process.expect(self._prompt_pattern)
+
+    def cont(self):
+        """Send continue to GDB"""
+        self._process.sendline("continue")
+
+
+class SSHController:
+    """Controller for SSH session to QEMU guest"""
+
+    def __init__(self, process, logger, params):
+        """
+        Initialize SSH controller.
+
+        :param process: pexpect SSH process
+        :param logger: Logger instance
+        :param params: SSH connection parameters
+        """
+        self._process = process
+        self._logger = logger
+        self._params = params
+        self._prompt = params.get("prompt", "root@rros")
+
+    def login(self):
+        """Perform SSH login"""
+        host = f"{self._params.get('username')}@{self._params.get('ssh_host')}"
+        self._process.expect(host)
+        self._process.sendline(self._params.get("password", "root"))
+        self._process.expect(self._prompt)
+        self._logger.debug("SSH connected to QEMU successfully")
+
+    def execute_command(self, command, timeout=30):
+        """
+        Execute a command via SSH.
+
+        :param command: Command string
+        :param timeout: Command timeout in seconds
+        :return: True if successful, False otherwise
+        """
+        self._logger.debug("Executing SSH command: %s", command)
+        self._process.sendline(command)
+
+        try:
+            self._process.expect(self._prompt, timeout=timeout)
+            self._logger.debug("SSH command completed: %s", command)
+            return True
+        except pexpect.TIMEOUT:
+            self._logger.warning("Timeout waiting for SSH command: %s", command)
+            return False
+        except pexpect.EOF:
+            self._logger.info("SSH process ended after command: %s", command)
+            return False
+
+
+class FaultInjectionCoordinator:
+    """Coordinates fault injection process using GDB and SSH"""
+
+    def __init__(self, logger, params):
+        """
+        Initialize fault injection coordinator.
+
+        :param logger: Logger instance
+        :param params: Fault injection parameters
+        """
+        self._logger = logger
+        self._params = params
+        self._process_manager = ProcessManager(logger)
+
+    def inject(self, gdb_commands, log_stdout, log_stderr):
+        """
+        Execute fault injection.
+
+        :param gdb_commands: List of GDB commands to execute
+        :param log_stdout: Path to stdout log file
+        :param log_stderr: Path to stderr log file
+        """
+        try:
+            # Wait for SSH if required
+            if self._params.get("inject_after_boot", False):
+                if not self._wait_for_boot():
+                    return
+
+            # Reserve time for LAVA login
+            time.sleep(5)
+            self._logger.debug("Starting fault injection, commands: %s", gdb_commands)
+
+            with open(log_stdout, "wb") as stdout, open(log_stderr, "wb") as _stderr:
+                # Initialize GDB and SSH
+                gdb_process = self._process_manager.spawn(
+                    "gdb-multiarch", ["-q"], stdout
+                )
+                gdb_ctrl = GDBController(gdb_process, self._logger)
+                gdb_ctrl.wait_ready()
+
+                ssh_process = self._spawn_ssh(stdout)
+                ssh_ctrl = SSHController(ssh_process, self._logger, self._params)
+                ssh_ctrl.login()
+
+                # Execute commands
+                self._execute_commands(gdb_commands, gdb_ctrl, ssh_ctrl)
+
+        except Exception as e:
+            self._logger.error("Error in fault injection: %s", str(e))
+        finally:
+            self._process_manager.cleanup()
+            self._logger.debug("Fault injection completed")
+
+    def _wait_for_boot(self):
+        """Wait for system boot completion"""
+        ssh_host = self._params.get("ssh_host", "localhost")
+        ssh_port = self._params.get("ssh_port", 22)
+        self._logger.debug(f"Waiting for boot: {ssh_host}:{ssh_port}")
+
+        if not wait_for_ssh(ssh_host, ssh_port):
+            self._logger.error("Wait for boot completion timeout")
+            return False
+        return True
+
+    def _spawn_ssh(self, logfile):
+        """Spawn SSH connection to guest"""
+        host = f"{self._params.get('username')}@{self._params.get('ssh_host')}"
+        ssh_args = [
+            "-o",
+            "StrictHostKeyChecking=no",
+            "-p",
+            str(self._params.get("ssh_port")),
+            host,
+        ]
+        return self._process_manager.spawn("ssh", ssh_args, logfile)
+
+    def _execute_commands(self, commands, gdb_ctrl, ssh_ctrl):
+        """
+        Execute GDB and SSH commands.
+
+        :param commands: List of commands
+        :param gdb_ctrl: GDB controller instance
+        :param ssh_ctrl: SSH controller instance
+        """
+        for cmd in commands:
+            if cmd.strip().startswith("sshcommand"):
+                self._execute_ssh_command(cmd, gdb_ctrl, ssh_ctrl)
+            else:
+                gdb_ctrl.execute_command(cmd)
+
+    def _execute_ssh_command(self, cmd, gdb_ctrl, ssh_ctrl):
+        """
+        Execute SSH command through GDB debugging session.
+
+        :param cmd: SSH command string
+        :param gdb_ctrl: GDB controller instance
+        :param ssh_ctrl: SSH controller instance
+        """
+        # Interrupt GDB and continue to let SSH command run
+        gdb_ctrl.interrupt()
+        gdb_ctrl.cont()
+        self._logger.debug("Interrupt GDB and send continue to let SSH command run")
+
+        # Extract and execute SSH command
+        parts = cmd.split("sshcommand ", 1)
+        if len(parts) == 2:
+            ssh_ctrl.execute_command(parts[1])
+        else:
+            self._logger.error("Invalid sshcommand format: %s", cmd)
+
+        # Interrupt GDB again
+        gdb_ctrl.interrupt()
 
 
 def fault_inject_callback(flipshell, log_stdout, log_stderr, logger, params):
     """
-    Use pexpect to start gdb-multiarch and execute commands one by one
+    Execute fault injection using GDB and SSH.
 
     :param flipshell: List of command arguments for gdb-multiarch
     :param log_stdout: Path to stdout log file
     :param log_stderr: Path to stderr log file
     :param logger: Logger instance
-    :param params: The `fault_inject_params` in job definition YAML and some additional parameters in job definition YAML
+    :param params: Fault injection parameters from job definition
     """
-    try:
-        # Extract gdb binary and commands from flipshell
-        if not flipshell or flipshell[0] != "gdb-multiarch":
-            logger.error("Invalid flipshell command structure")
-            return
+    # Parse GDB commands
+    parser = GDBCommandParser()
+    gdb_commands = parser.parse(flipshell)
 
-        # Parse commands from flipshell list
-        gdb_commands = []
-        i = 1  # Skip "gdb-multiarch"
-        while i < len(flipshell):
-            if flipshell[i] == "-ex" and i + 1 < len(flipshell):
-                gdb_commands.append(flipshell[i + 1])
-                i += 2
-            elif flipshell[i] in ["-q", "-batch"]:
-                # Skip these flags as we handle them differently with pexpect
-                i += 1
-            else:
-                i += 1
+    if not gdb_commands:
+        logger.error("Invalid flipshell command structure or no commands found")
+        return
 
-        if not gdb_commands:
-            logger.warning("No gdb commands found in flipshell")
-            return
-
-        if params.get("inject_after_boot", False):
-            ssh_host = params.get("ssh_host", "localhost")
-            ssh_port = params.get("ssh_port", 22)
-            logger.debug(
-                f"Wait for boot completion by checking ssh: host {ssh_host}, port {ssh_port}"
-            )
-            if not wait_for_ssh(ssh_host, ssh_port):
-                logger.error("Wait for boot completion timeout")
-                return
-        # Reserve some time for the login operation of Lava.
-        logger.debug("Sleep 5 seconds")
-        time.sleep(5)
-        logger.debug("Starting gdb-multiarch with pexpect, commands: %s", gdb_commands)
-
-        with open(log_stdout, "wb") as stdout, open(log_stderr, "wb") as _stderr:
-            # Start gdb-multiarch with pexpect
-            gdb_process = pexpect.spawn("gdb-multiarch", ["-q"])
-            gdb_process.logfile = stdout
-
-            # Wait for the (gdb) prompt
-            gdb_process.expect(r"\(gdb\)\s*")
-            logger.debug("GDB started and ready")
-
-            # Start ssh with pexpect
-            host = f"{params.get('username')}@{params.get('ssh_host')}"
-            ssh_process = pexpect.spawn(
-                "ssh",
-                [
-                    "-o",
-                    "StrictHostKeyChecking=no",
-                    "-p",
-                    str(params.get("ssh_port")),
-                    host,
-                ],
-            )
-            ssh_process.logfile = stdout
-            ssh_process.expect(host)
-            ssh_process.sendline(params.get("password", "root"))
-            ssh_process.expect(params.get("prompt", "root@rros"))
-            logger.debug("SSH connect to qemu success")
-
-            # Execute each command one by one
-            for cmd in gdb_commands:
-                if cmd.strip().startswith("sshcommand"):
-                    # Send ctrl+c and continue to gdb, let ssh command run in qemu
-                    gdb_process.sendcontrol("c")
-                    gdb_process.expect(r"\(gdb\)\s*")
-                    gdb_process.sendline("continue")
-
-                    logger.debug(
-                        "[fault_inject_callback] Executing SSH command: %s", cmd
-                    )
-                    if len(cmd.split("sshcommand ")) == 2:
-                        ssh_process.sendline(cmd.split("sshcommand ")[1])
-                        logger.debug(f"[fault_inject_callback] Send SSH command: {cmd}")
-                    else:
-                        logger.error(
-                            "[fault_inject_callback] command should look like: 'sshcommand <your command>'"
-                        )
-
-                    # Wait for the ssh prompt to ensure command completion
-                    try:
-                        ssh_process.expect(
-                            params.get("prompt", "root@rros"), timeout=30
-                        )
-                        logger.debug(
-                            "[fault_inject_callback] SSH command completed: %s", cmd
-                        )
-                    except pexpect.TIMEOUT:
-                        logger.warning(
-                            "[fault_inject_callback] Timeout waiting for SSH command completion: %s",
-                            cmd,
-                        )
-                        # Continue with next command even if timeout
-                    except pexpect.EOF:
-                        logger.info(
-                            "[fault_inject_callback] SSH process ended after command: %s",
-                            cmd,
-                        )
-
-                    # Send ctrl+c to GDB
-                    gdb_process.sendcontrol("c")
-                    gdb_process.expect(r"\(gdb\)\s*")
-                else:
-                    logger.debug(
-                        "[fault_inject_callback] Executing GDB command: %s", cmd
-                    )
-                    gdb_process.sendline(cmd)
-
-                    # Wait for the (gdb) prompt to ensure command completion
-                    try:
-                        gdb_process.expect(r"\(gdb\)\s*", timeout=30)
-                        logger.debug(
-                            "[fault_inject_callback] GDB command completed: %s", cmd
-                        )
-                    except pexpect.TIMEOUT:
-                        logger.warning(
-                            "[fault_inject_callback] Timeout waiting for GDB command completion: %s",
-                            cmd,
-                        )
-                        # Continue with next command even if timeout
-                    except pexpect.EOF:
-                        logger.info(
-                            "[fault_inject_callback] GDB process ended after command: %s",
-                            cmd,
-                        )
-
-            # Ensure gdb exits cleanly if still running
-            if gdb_process.isalive():
-                logger.debug("[fault_inject_callback] Closing GDB process")
-
-                gdb_process.close()
-
-            # Free ssh_process
-            if ssh_process.isalive():
-                logger.debug("[fault_inject_callback] Closing SSH process")
-
-                ssh_process.close()
-
-    except Exception as e:
-        logger.error("Error in fault injection: %s", str(e))
-
-    logger.debug("Fault injection thread completed, Command was %s", flipshell)
+    # Execute fault injection
+    coordinator = FaultInjectionCoordinator(logger, params)
+    coordinator.inject(gdb_commands, log_stdout, log_stderr)
 
 
 def parse_time_string(time_str):
@@ -1199,16 +1611,13 @@ def app_inject(socket_client: SocketClient_app):
 
 
 def parse_json_objects(buffer):
-    results = []
-    while buffer:
-        try:
-            obj, idx = json.JSONDecoder().raw_decode(buffer)
-            results.append(obj)
-            buffer = buffer[idx:].lstrip()  # remove parsed part
-        except json.JSONDecodeError:
-            # partial data, receive next time.
-            break
-    return results, buffer
+    """
+    Parse multiple JSON objects from buffer (backward compatibility wrapper).
+
+    :param buffer: String buffer containing JSON data
+    :return: Tuple of (list of parsed objects, remaining buffer)
+    """
+    return QMPMonitor._parse_json_buffer(buffer)
 
 
 # FIXME: implement a QEMU protocol to monitor VM boots
