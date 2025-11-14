@@ -159,16 +159,71 @@ class BaseUnixSocketClient:
 class QMPEventHandler:
     """Handler for QEMU Machine Protocol (QMP) events"""
 
-    def __init__(self, logger, shell):
+    def __init__(self, logger, shell, dump_dir="/var/log/qemu-vmcores"):
         """
         Initialize QMP event handler.
 
         :param logger: Logger instance
         :param shell: pexpect.spawn shell for QEMU interaction
+        :param dump_dir: Directory to store vmcore dumps
         """
         self._logger = logger
         self._shell = shell
         self._panic_count = 0
+        self._dump_dir = dump_dir
+        self._qmp_socket = None
+
+    def set_qmp_socket(self, qmp_socket):
+        """
+        Set the QMP socket for sending commands.
+
+        :param qmp_socket: Socket connection to QMP server
+        """
+        self._qmp_socket = qmp_socket
+
+    def _execute_dump_guest_memory(self):
+        """
+        Execute dump-guest-memory command via QMP.
+
+        Generates a vmcore file that can be analyzed with crash utility.
+        """
+        if not self._qmp_socket:
+            self._logger.error("QMP socket not available for dump-guest-memory")
+            return
+
+        # Create dump directory if it doesn't exist
+        os.makedirs(self._dump_dir, exist_ok=True)
+
+        # Generate filename with timestamp
+        from datetime import datetime
+
+        timestamp = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+        dump_file = os.path.join(self._dump_dir, f"vmcore-{timestamp}.vmcore")
+
+        # Prepare dump-guest-memory command
+        # Using paging=True for better crash/gdb compatibility
+        dump_cmd = {
+            "execute": "dump-guest-memory",
+            "arguments": {"paging": True, "protocol": f"file:{dump_file}"},
+        }
+
+        try:
+            self._logger.info(f"Executing dump-guest-memory -> {dump_file}")
+
+            # Send command to QMP
+            cmd_json = json.dumps(dump_cmd)
+            self._qmp_socket.sendall(cmd_json.encode())
+
+            # Wait for response
+            response_data = self._qmp_socket.recv(4096)
+            if response_data:
+                response = json.loads(response_data.decode())
+                self._logger.info(f"dump-guest-memory response: {response}")
+            else:
+                self._logger.warning("No response from dump-guest-memory command")
+
+        except Exception as e:
+            self._logger.error(f"Failed to execute dump-guest-memory: {e}")
 
     def handle_event(self, event):
         """
@@ -176,9 +231,19 @@ class QMPEventHandler:
 
         :param event: Parsed JSON event dictionary
         """
-        if event.get("event", "") == "GUEST_PANICKED":
+        event_name = event.get("event", "")
+
+        if event_name in ("GUEST_PANICKED", "GUEST_CRASHLOADED"):
             self._panic_count += 1
-            self._logger.debug("QEMU panic detected! Count: %d", self._panic_count)
+            self._logger.debug(
+                "QEMU panic/crash detected! Event: %s, Count: %d",
+                event_name,
+                self._panic_count,
+            )
+
+            # Dump guest memory for crash analysis
+            self._execute_dump_guest_memory()
+
             # Send enter to QEMU when it restores to match pexpect prompt
             self._shell.send("\r")
             self._logger.debug("Sent enter to QEMU shell")
@@ -192,16 +257,17 @@ class QMPEventHandler:
 class QMPMonitor(BaseUnixSocketClient):
     """Monitor for QEMU QMP events, specifically tracking panic events"""
 
-    def __init__(self, server_address, logger, shell):
+    def __init__(self, server_address, logger, shell, dump_dir="/var/log/qemu-vmcores"):
         """
         Initialize QMP monitor.
 
         :param server_address: QMP socket file path
         :param logger: Logger instance
         :param shell: pexpect.spawn shell for QEMU interaction
+        :param dump_dir: Directory to store vmcore dumps
         """
         super().__init__(server_address, logger)
-        self._event_handler = QMPEventHandler(logger, shell)
+        self._event_handler = QMPEventHandler(logger, shell, dump_dir)
         self._max_listen_time = 300  # 5 minutes
         self._recv_timeout = 5
 
@@ -210,6 +276,19 @@ class QMPMonitor(BaseUnixSocketClient):
         buffer = ""
         self._sock.settimeout(self._recv_timeout)
         start_time = time.time()
+
+        # Enable QMP capabilities first
+        try:
+            self._sock.sendall(b'{"execute": "qmp_capabilities"}')
+            # Read QMP greeting and capability response
+            greeting = self._sock.recv(1024)
+            self._logger.debug(f"QMP greeting: {greeting.decode()}")
+        except Exception as e:
+            self._logger.error(f"Failed to enable QMP capabilities: {e}")
+            return
+
+        # Set the socket for dump operations
+        self._event_handler.set_qmp_socket(self._sock)
 
         try:
             while time.time() - start_time < self._max_listen_time:
@@ -261,8 +340,8 @@ class QMPMonitor(BaseUnixSocketClient):
 class SocketClient(QMPMonitor):
     """Backward compatible alias for QMPMonitor"""
 
-    def __init__(self, server_address, logger, shell):
-        super().__init__(server_address, logger, shell)
+    def __init__(self, server_address, logger, shell, dump_dir="/var/log/qemu-vmcores"):
+        super().__init__(server_address, logger, shell, dump_dir)
         # Keep original attribute names for compatibility
         self.panic = 0
         self.shell = shell
@@ -999,7 +1078,9 @@ class CallQemuAction(Action):
 
         # Create a client connected to qemu qmp server to read the panic event and count it
         try:
-            socket_client = SocketClient(socket_file, self.logger, shell)
+            # Get dump directory from fault_inject_params or use default
+            dump_dir = fault_inject_params.get("vmcore_dir", "/var/log/qemu-vmcores")
+            socket_client = SocketClient(socket_file, self.logger, shell, dump_dir)
             panic_thread = threading.Thread(
                 target=panic_count, args=(socket_client, self.job.job_id)
             )

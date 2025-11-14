@@ -23,13 +23,14 @@ def qemu_fault_inject():
         Optional("qmp_socket"): str,
         Optional("socket_app"): str,
         Optional("start_command"): str,
-        Optional("port"): str,
+        Optional("port"): int,
         Optional("host"): str,
         Optional("guest_send_path"): str,
         Optional("inject_after_boot"): bool,
         Optional("ssh_port"): int,
         Optional("ssh_host"): str,
         Optional("serial_socket"): str,
+        Optional("vmcore_dir"): str,
     }
 
 
