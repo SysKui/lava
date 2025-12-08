@@ -159,7 +159,13 @@ class BaseUnixSocketClient:
 class QMPEventHandler:
     """Handler for QEMU Machine Protocol (QMP) events"""
 
-    def __init__(self, logger, shell, dump_dir="/var/log/qemu-vmcores"):
+    def __init__(
+        self,
+        logger,
+        shell,
+        dump_dir="/lib/modules/qemu-vmcores",
+        job_id=None,
+    ):
         """
         Initialize QMP event handler.
 
@@ -172,6 +178,7 @@ class QMPEventHandler:
         self._panic_count = 0
         self._dump_dir = dump_dir
         self._qmp_socket = None
+        self._job_id = job_id
 
     def set_qmp_socket(self, qmp_socket):
         """
@@ -194,11 +201,14 @@ class QMPEventHandler:
         # Create dump directory if it doesn't exist
         os.makedirs(self._dump_dir, exist_ok=True)
 
-        # Generate filename with timestamp
+        # Generate filename with job id and timestamp to make correlation easier
         from datetime import datetime
 
-        timestamp = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
-        dump_file = os.path.join(self._dump_dir, f"vmcore-{timestamp}.vmcore")
+        timestamp = datetime.now().strftime("%Y%m%dT%H%M%SZ")
+        job_part = str(self._job_id) if self._job_id is not None else "unknown"
+        dump_file = os.path.join(
+            self._dump_dir, f"vmcore-{job_part}-{timestamp}.vmcore"
+        )
 
         # Prepare dump-guest-memory command
         # Using paging=True for better crash/gdb compatibility
@@ -222,8 +232,52 @@ class QMPEventHandler:
             else:
                 self._logger.warning("No response from dump-guest-memory command")
 
+            # Wait a moment for dump file to be written
+            time.sleep(2)
+
+            # Record vmcore information for test results
+            if self._job_id is not None and os.path.exists(dump_file):
+                self._record_vmcore_result(dump_file)
+            else:
+                if self._job_id is None:
+                    self._logger.warning(
+                        "No job_id available, skipping vmcore recording"
+                    )
+                if not os.path.exists(dump_file):
+                    self._logger.warning(f"Dump file {dump_file} does not exist")
+
         except Exception as e:
             self._logger.error(f"Failed to execute dump-guest-memory: {e}")
+
+    def _record_vmcore_result(self, dump_file):
+        """
+        Record vmcore file information as a test result.
+        This will be picked up by dbutils.py and saved to database.
+
+        :param dump_file: Path to the vmcore file
+        """
+        try:
+            filename = os.path.basename(dump_file)
+            file_size = os.path.getsize(dump_file)
+
+            # Log as a test result that will be processed by LAVA results system
+            vmcore_result = {
+                "definition": "lava",
+                "case": "vmcore-capture",
+                "result": "pass",
+                "vmcore_path": dump_file,
+                "vmcore_filename": filename,
+                "vmcore_size": file_size,
+            }
+
+            self._logger.results(vmcore_result)
+            self._logger.info(
+                f"Recorded vmcore result for job {self._job_id}, "
+                f"filename: {filename}, size: {file_size} bytes, path: {dump_file}"
+            )
+
+        except Exception as e:
+            self._logger.error(f"Failed to record vmcore result: {e}")
 
     def handle_event(self, event):
         """
@@ -257,7 +311,14 @@ class QMPEventHandler:
 class QMPMonitor(BaseUnixSocketClient):
     """Monitor for QEMU QMP events, specifically tracking panic events"""
 
-    def __init__(self, server_address, logger, shell, dump_dir="/var/log/qemu-vmcores"):
+    def __init__(
+        self,
+        server_address,
+        logger,
+        shell,
+        dump_dir="/lib/modules/qemu-vmcores",
+        job_id=None,
+    ):
         """
         Initialize QMP monitor.
 
@@ -267,7 +328,7 @@ class QMPMonitor(BaseUnixSocketClient):
         :param dump_dir: Directory to store vmcore dumps
         """
         super().__init__(server_address, logger)
-        self._event_handler = QMPEventHandler(logger, shell, dump_dir)
+        self._event_handler = QMPEventHandler(logger, shell, dump_dir, job_id)
         self._max_listen_time = 300  # 5 minutes
         self._recv_timeout = 5
 
@@ -340,8 +401,15 @@ class QMPMonitor(BaseUnixSocketClient):
 class SocketClient(QMPMonitor):
     """Backward compatible alias for QMPMonitor"""
 
-    def __init__(self, server_address, logger, shell, dump_dir="/var/log/qemu-vmcores"):
-        super().__init__(server_address, logger, shell, dump_dir)
+    def __init__(
+        self,
+        server_address,
+        logger,
+        shell,
+        dump_dir="/lib/modules/qemu-vmcores",
+        job_id=None,
+    ):
+        super().__init__(server_address, logger, shell, dump_dir, job_id)
         # Keep original attribute names for compatibility
         self.panic = 0
         self.shell = shell
@@ -1079,8 +1147,16 @@ class CallQemuAction(Action):
         # Create a client connected to qemu qmp server to read the panic event and count it
         try:
             # Get dump directory from fault_inject_params or use default
-            dump_dir = fault_inject_params.get("vmcore_dir", "/var/log/qemu-vmcores")
-            socket_client = SocketClient(socket_file, self.logger, shell, dump_dir)
+            dump_dir = fault_inject_params.get(
+                "vmcore_dir", "/lib/modules/qemu-vmcores"
+            )
+            socket_client = SocketClient(
+                socket_file,
+                self.logger,
+                shell,
+                dump_dir,
+                job_id=self.job.job_id,
+            )
             panic_thread = threading.Thread(
                 target=panic_count, args=(socket_client, self.job.job_id)
             )
